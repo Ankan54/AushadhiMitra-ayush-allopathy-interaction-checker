@@ -2,17 +2,24 @@
 
 ## Overview
 
-AushadhiMitra is a multi-agent AI system that checks for drug interactions between AYUSH (traditional Indian medicine) and allopathic (modern pharmaceutical) medicines. The system provides a conversational interface accessible via WhatsApp and web platforms, employing specialized AI agents to identify medicines, check interactions through multiple data layers, and generate patient-friendly explanations in English and Hindi.
+AushadhiMitra is a multi-agent AI system that checks for drug interactions between AYUSH (traditional Indian medicine) and allopathic (modern pharmaceutical) medicines. The system uses CrewAI Flows to orchestrate parallel data gathering from multiple sources (IMPPAT for AYUSH phytochemicals, DrugBank/Drugs.com for allopathic drugs, web search for research), performs grounded reasoning with conflict detection, and generates responses tailored to two user personas: AYUSH practitioners (detailed technical view) and patients (simple multilingual chat).
 
-The architecture follows a hub-and-spoke pattern with an Orchestrator Agent coordinating three specialist agents: Medicine Identifier Agent, Interaction Checker Agent, and Explanation Agent. Each agent has specific tools and responsibilities, ensuring separation of concerns and maintainability. The system uses a five-layer interaction checking approach: curated database lookup, pharmacodynamic effect matching, CYP450 pathway inference, research literature search (RAG), and web search fallback.
+The architecture emphasizes real-time data gathering to ensure accuracy and relevancy, with automatic fallback to local cached data for reliability. All responses are strictly grounded in gathered evidence with full source citation and transparent handling of conflicting information.
 
 **Key Design Principles:**
-- Multi-agent architecture for separation of concerns
-- Layered interaction checking from high-confidence to inferred
-- Patient-first explanations with appropriate medical disclaimers
-- Bilingual support (English and Hindi)
-- Evidence-based recommendations with source citations
-- Graceful degradation when data is incomplete
+- Real-time data gathering with local fallback for reliability
+- Grounded reasoning - LLM uses ONLY provided evidence, not internal knowledge
+- Transparent conflict detection and reporting when sources disagree
+- Evidence hierarchy for resolving conflicts (Clinical > In Vivo > In Vitro > Predicted)
+- Full source citation with clickable URLs for verification
+- Rule-based severity scoring augmented by LLM explanation
+- Two user personas with shared data gathering but different output formatting
+- Parallel processing for faster response times
+
+**Agent Architecture:**
+- **5 Specialist Agents**: AYUSH Data Agent, Allopathy Data Agent, Reasoning Agent, Professional Formatter Agent, Communicator Agent
+- **Shared Components**: AYUSH and Allopathy Data Agents used by both Professional and Patient flows
+- **Persona-Specific Formatters**: Professional Formatter (structured UI data) and Communicator (multilingual chat)
 
 ## Architecture
 
@@ -20,102 +27,137 @@ The architecture follows a hub-and-spoke pattern with an Orchestrator Agent coor
 
 The system consists of four main layers:
 
-1. **Interface Layer**: WhatsApp (via Twilio) and Web Chat (Streamlit) interfaces
-2. **Orchestration Layer**: Orchestrator Agent managing conversation flow and agent routing
-3. **Agent Layer**: Three specialist agents (Medicine Identifier, Interaction Checker, Explanation)
-4. **Data Layer**: SQLite databases, JSON files, and ChromaDB vector store
-
+1. **Interface Layer**: Web UI for professionals, Chat UI (simulating WhatsApp) for patients
+2. **Flow Orchestration Layer**: Two CrewAI Flows (Professional and Patient) with shared data agents
+3. **Agent Layer**: Five specialist agents (AYUSH Data, Allopathy Data, Reasoning, Professional Formatter, Communicator)
+4. **Data Layer**: Local JSON/SQLite for fallback, real-time web scraping for primary data
 
 ```mermaid
 graph TB
     subgraph UI["User Interfaces"]
-        WA[WhatsApp via Twilio]
-        WEB[Web Chat Streamlit]
+        WEB["Web UI<br/>(Professional)"]
+        CHAT["Chat UI<br/>(Patient)"]
     end
     
-    subgraph ORCH["Orchestrator Agent"]
-        OA[Intent Parsing<br/>Conversation Management<br/>Agent Routing<br/>Response Synthesis]
+    subgraph FLOWS["CrewAI Flows"]
+        PF["Professional Flow"]
+        CF["Patient Flow"]
     end
     
     subgraph AGENTS["Specialist Agents"]
-        MIA[Medicine Identifier Agent]
-        ICA[Interaction Checker Agent]
-        EA[Explanation Agent]
+        AYUSH["AYUSH Data Agent"]
+        ALLO["Allopathy Data Agent"]
+        REASON["Reasoning Agent"]
+        PROFORMAT["Professional Formatter Agent"]
+        COMM["Communicator Agent"]
     end
     
-    subgraph DATA["Data Layer"]
-        ALLO[(Allopathic Drugs<br/>SQLite)]
-        AYUSH[(AYUSH Medicines<br/>SQLite)]
-        INTER[(Interactions<br/>JSON)]
-        RAG[(Research Papers<br/>ChromaDB)]
+    subgraph DATA["Data Sources"]
+        LOCAL["Local Cache<br/>(JSON/SQLite)"]
+        IMPPAT["IMPPAT Website"]
+        DRUGBANK["DrugBank/Drugs.com"]
+        WEBSEARCH["Web Search<br/>(Research Articles)"]
     end
     
-    WA --> OA
-    WEB --> OA
-    OA --> MIA
-    OA --> ICA
-    OA --> EA
-    MIA --> ALLO
-    MIA --> AYUSH
-    ICA --> INTER
-    ICA --> RAG
-    EA --> INTER
+    WEB --> PF
+    CHAT --> CF
+    
+    PF --> AYUSH
+    PF --> ALLO
+    CF --> AYUSH
+    CF --> ALLO
+    
+    AYUSH --> LOCAL
+    AYUSH --> IMPPAT
+    AYUSH --> WEBSEARCH
+    
+    ALLO --> LOCAL
+    ALLO --> DRUGBANK
+    ALLO --> WEBSEARCH
+    
+    PF --> REASON
+    CF --> REASON
+    
+    REASON --> WEBSEARCH
+    
+    PF --> PROFORMAT
+    PROFORMAT -.-> WEB
+    CF --> COMM
+    COMM -.-> CHAT
 ```
 
 ### Technology Stack
 
 **Core Technologies:**
 - **Language**: Python 3.10+
-- **Agent Framework**: CrewAI for multi-agent orchestration
-- **LLM**: Amazon Bedrock API (Claude) for reasoning and generation
+- **Agent Framework**: CrewAI Flows for multi-agent orchestration
+- **LLM**: Claude API (via Anthropic or AWS Bedrock) for reasoning and generation
+- **Web Scraping**: BeautifulSoup, Requests for IMPPAT/DrugBank scraping
+- **Web Search**: Tavily API for research article search
 - **Backend**: FastAPI with WebSocket support
-- **Frontend**: Streamlit for web interface
-- **WhatsApp**: Twilio API for messaging
+- **Frontend**: Streamlit for both Web UI and Chat UI
 
 **Data Storage:**
-- **Structured Data**: SQLite for medicine databases
-- **Interactions**: JSON files for curated interactions
-- **Vector Store**: ChromaDB for research paper embeddings
-- **Caching**: In-memory caching for frequently accessed data
+- **Local Cache**: JSON files for pre-extracted IMPPAT data and curated interactions
+- **Medicine Database**: SQLite for AYUSH and allopathic medicine metadata
+- **Session State**: In-memory for conversation context
 
 **Key Libraries:**
-- `crewai` - Multi-agent orchestration
-- `fastapi` - API server and WebSocket
-- `streamlit` - Web UI
-- `twilio` - WhatsApp integration
-- `boto3` - AWS Bedrock access
-- `chromadb` - Vector database for RAG
+- `crewai` - Multi-agent orchestration with Flows
+- `fastapi` - API server
+- `streamlit` - Web and Chat UI
+- `beautifulsoup4` - Web scraping
+- `requests` - HTTP requests
+- `tavily-python` - Web search API
+- `anthropic` / `boto3` - LLM access
 - `pydantic` - Data validation
-- `langchain` - LLM utilities
 
-### Interaction Checking Flow
+### High-Level Data Flow
 
 ```mermaid
 flowchart TD
-    START([User Query: Check Medicines]) --> PARSE[Orchestrator: Parse and Extract Medicines]
-    PARSE --> IDENTIFY[Medicine Identifier: Normalize Names]
-    IDENTIFY --> PAIRS[Generate All Pairwise Combinations]
+    START([User Input: Check Medicines]) --> IDENTIFY[Identify Medicine Types]
+    IDENTIFY --> PARALLEL{Parallel Execution}
     
-    PAIRS --> L1{Layer 1: Curated DB}
-    L1 -->|Found| RESULT[Collect Interaction]
-    L1 -->|Not Found| L2{Layer 2: Pharmacodynamic}
+    PARALLEL --> AYUSH_FLOW[AYUSH Data Agent]
+    PARALLEL --> ALLO_FLOW[Allopathy Data Agent]
     
-    L2 -->|Found| RESULT
-    L2 -->|Not Found| L3{Layer 3: CYP450}
+    subgraph AYUSH_GATHER["AYUSH Data Gathering"]
+        AYUSH_FLOW --> LOCAL_LOOKUP[Lookup Local DB<br/>Common Name → Scientific Name]
+        LOCAL_LOOKUP --> GET_PHYTO[Get Phytochemical Links]
+        GET_PHYTO --> SCRAPE_IMPPAT[Scrape IMPPAT<br/>for ADMET Properties]
+        SCRAPE_IMPPAT --> SEARCH_INDUCER[Web Search<br/>for CYP Inducers]
+        SCRAPE_IMPPAT -.->|On Error| FALLBACK_A[Use Local Cache]
+    end
     
-    L3 -->|Found| RESULT
-    L3 -->|Not Found| L4{Layer 4: RAG Search}
+    subgraph ALLO_GATHER["Allopathy Data Gathering"]
+        ALLO_FLOW --> SEARCH_BRAND[Web Search<br/>Brand → Generic Name]
+        SEARCH_BRAND --> SCRAPE_DRUGBANK[Scrape DrugBank/Drugs.com<br/>for CYP Data]
+        SCRAPE_DRUGBANK --> SEARCH_INDUCER2[Web Search<br/>for CYP Inducers]
+        SCRAPE_DRUGBANK -.->|On Error| FALLBACK_B[Use Local Cache]
+    end
     
-    L4 -->|Found| RESULT
-    L4 -->|Not Found| L5{Layer 5: Web Search}
+    SEARCH_INDUCER --> COMBINE[Combine Evidence]
+    FALLBACK_A --> COMBINE
+    SEARCH_INDUCER2 --> COMBINE
+    FALLBACK_B --> COMBINE
     
-    L5 -->|Found| RESULT
-    L5 -->|Not Found| NO_DATA[No Interaction Data]
+    COMBINE --> REASON_AGENT[Reasoning Agent]
     
-    RESULT --> SEVERITY[Calculate Severity]
-    NO_DATA --> SEVERITY
-    SEVERITY --> EXPLAIN[Explanation Agent: Generate Response]
-    EXPLAIN --> OUTPUT([Formatted Output to User])
+    subgraph REASONING["Grounded Reasoning"]
+        REASON_AGENT --> SEARCH_RESEARCH[Web Search<br/>Research Articles]
+        SEARCH_RESEARCH --> CONFLICT_CHECK[Conflict Detection]
+        CONFLICT_CHECK --> SEVERITY_CALC[Rule-based Severity<br/>Calculation]
+        SEVERITY_CALC --> GENERATE[Generate Grounded<br/>Assessment]
+    end
+    
+    GENERATE --> ROUTE{Route by<br/>User Type}
+    
+    ROUTE -->|Professional| PRO_FORMAT[Professional Formatter Agent<br/>Structure for UI]
+    ROUTE -->|Patient| COMM_AGENT[Communicator Agent<br/>Simple + Multilingual]
+    
+    PRO_FORMAT --> OUTPUT_PRO([Professional Web View])
+    COMM_AGENT --> OUTPUT_CHAT([Patient Chat Response])
 ```
 
 ### Agent Communication Pattern
@@ -123,1046 +165,1257 @@ flowchart TD
 ```mermaid
 sequenceDiagram
     participant U as User
-    participant O as Orchestrator
-    participant M as Medicine Identifier
-    participant I as Interaction Checker
-    participant E as Explanation Agent
-    participant D as Data Layer
+    participant O as Orchestrator/Flow
+    participant A as AYUSH Data Agent
+    participant D as Allopathy Data Agent
+    participant R as Reasoning Agent
+    participant P as Professional Formatter
+    participant C as Communicator Agent
+    participant W as Web/IMPPAT/DrugBank
     
-    U->>O: Check metformin + ashwagandha
-    O->>O: Parse intent and extract medicines
+    U->>O: Check Ashwagandha + Metformin
+    O->>O: Identify: AYUSH + Allopathic
     
-    O->>M: Identify metformin
-    M->>D: Query drug database
-    D-->>M: Metformin details
-    M-->>O: Normalized medicine 1
+    par Parallel Data Gathering
+        O->>A: Gather AYUSH data (Ashwagandha)
+        A->>A: Lookup local DB → Scientific name
+        A->>W: Scrape IMPPAT → Phytochemicals + ADMET
+        W-->>A: Withanolide A, CYP effects
+        A->>W: Web search → CYP inducer data
+        W-->>A: Inducer research findings
+        A-->>O: AYUSH Evidence Package
+    and
+        O->>D: Gather Allopathy data (Metformin)
+        D->>W: Web search → Brand to generic
+        W-->>D: Metformin (Biguanide)
+        D->>W: Scrape DrugBank → CYP metabolism
+        W-->>D: CYP substrate info
+        D-->>O: Allopathy Evidence Package
+    end
     
-    O->>M: Identify ashwagandha
-    M->>D: Query AYUSH database
-    D-->>M: Ashwagandha details
-    M-->>O: Normalized medicine 2
+    O->>R: Analyze interaction with evidence
+    R->>W: Web search → Research articles
+    W-->>R: PubMed results
+    R->>R: Detect conflicts in sources
+    R->>R: Calculate severity (rule-based)
+    R->>R: Generate grounded assessment
+    R-->>O: Interaction Report + Sources
     
-    O->>I: Check interaction
-    I->>D: Layer 1 Curated DB lookup
-    D-->>I: Interaction found
-    I->>I: Calculate severity
-    I-->>O: Interaction details
-    
-    O->>E: Generate explanation
-    E->>E: Format for channel
-    E->>E: Add disclaimer
-    E-->>O: Formatted response
-    
-    O-->>U: Display interaction warning
+    alt Professional User
+        O->>P: Format for professional UI
+        P->>P: Structure drug profiles
+        P->>P: Create ADMET comparison
+        P->>P: Organize source citations
+        P->>P: Generate technical summary
+        P-->>O: ProfessionalUIData
+        O-->>U: Detailed Web View + All Sources
+    else Patient User
+        O->>C: Summarize for patient
+        C->>C: Detect language, simplify
+        C-->>O: 4-5 sentence response
+        O-->>U: Simple chat response
+    end
 ```
 
 ## Components and Interfaces
 
-### 1. Orchestrator Agent
+### 1. Flow Orchestrator
 
-**Purpose**: Central coordinator that manages conversation flow, parses user intent, routes requests to specialist agents, and synthesizes final responses.
+**Purpose**: Manage the overall workflow using CrewAI Flows, route requests to appropriate flows based on user type, and coordinate parallel agent execution.
 
 **Responsibilities:**
-- Parse user messages to extract medicine names and understand intent
-- Maintain conversation state and context across multiple turns
-- Route requests to appropriate specialist agents based on intent
-- Synthesize responses from multiple agents into coherent output
-- Handle error cases and provide fallback responses
-- Send progress indicators for complex multi-medicine checks
+- Determine user type (Professional vs Patient) based on interface
+- Initialize and execute the appropriate CrewAI Flow
+- Coordinate parallel execution of data gathering agents
+- Handle timeouts and partial results
+- Maintain conversation context for chat interface
 
-**Key Methods:**
+**CrewAI Flow Definition:**
 ```python
-def parse_user_intent(message: str, context: ConversationContext) -> Intent
-def route_to_agent(intent: Intent, context: ConversationContext) -> AgentResponse
-def synthesize_response(agent_responses: List[AgentResponse]) -> str
-def maintain_context(session_id: str, message: str, response: str) -> None
-def send_progress_update(session_id: str, message: str) -> None
+from crewai import Flow, start, listen, router
+
+class AushadhiMitraFlow(Flow):
+    
+    @start()
+    def parse_input(self):
+        """Extract medicine names and determine types"""
+        # Returns: {ayush_medicines: [], allopathy_medicines: []}
+        pass
+    
+    @listen(parse_input)
+    async def gather_data_parallel(self, medicines):
+        """Execute data gathering agents in parallel"""
+        ayush_task = self.ayush_agent.gather(medicines['ayush_medicines'])
+        allo_task = self.allopathy_agent.gather(medicines['allopathy_medicines'])
+        
+        # Parallel execution
+        ayush_data, allo_data = await asyncio.gather(ayush_task, allo_task)
+        return {'ayush': ayush_data, 'allo': allo_data}
+    
+    @listen(gather_data_parallel)
+    def analyze_interaction(self, all_data):
+        """Reasoning agent analyzes gathered evidence"""
+        return self.reasoning_agent.analyze(all_data)
+    
+    @router(analyze_interaction)
+    def route_output(self, analysis):
+        """Route to appropriate output formatter"""
+        if self.user_type == 'professional':
+            return 'format_professional'
+        else:
+            return 'format_patient'
+    
+    @listen('format_professional')
+    def format_professional(self, analysis):
+        """Use Professional Formatter Agent to structure output for web UI"""
+        return self.professional_formatter_agent.format(analysis)
+    
+    @listen('format_patient')
+    def format_patient(self, analysis):
+        """Use Communicator Agent for patient-friendly response"""
+        return self.communicator_agent.summarize(analysis, self.user_language)
 ```
 
-**Input**: User message (text), session ID, conversation history
-**Output**: Formatted response to user, updated conversation state
+**Input**: User message, user type (professional/patient), session context
+**Output**: Formatted response appropriate for user type
 
-**Validates Requirements**: 1.1, 1.5, 8.1, 8.2, 8.3, 8.4, 8.5, 9.1, 9.2, 10.1, 10.3, 13.4
+**Validates Requirements**: 4.1, 4.2, 4.3, 4.4, 4.5, 10.1, 10.2, 10.3, 10.4, 10.5
 
-### 2. Medicine Identifier Agent
+### 2. AYUSH Data Agent
 
-**Purpose**: Normalize medicine names, identify medicine types (AYUSH vs Allopathic), and extract relevant metadata.
+**Purpose**: Gather comprehensive phytochemical and ADMET data for AYUSH medicines through local lookup and web scraping.
 
 **Responsibilities:**
-- Normalize medicine names handling misspellings and variations
-- Identify medicine type (AYUSH or Allopathic)
-- Map brand names to generic names
-- Extract ingredients from AYUSH formulations
-- Disambiguate when multiple matches exist
-- Recognize Hindi medicine names
+- Lookup local database for common name to scientific name mapping
+- Retrieve phytochemical links from pre-extracted IMPPAT data
+- Scrape IMPPAT website for ADMET properties (which displays SwissADME data)
+- Perform web search for CYP inducer information
+- Fallback to local cache on scraping errors
+
+**Data Gathering Flow:**
+```mermaid
+flowchart TD
+    INPUT[AYUSH Medicine Name] --> LOCAL[Lookup Local DB]
+    LOCAL -->|Found| PHYTO[Get Phytochemical Links]
+    LOCAL -->|Not Found| WEBSEARCH[Web Search for Info]
+    
+    PHYTO --> SCRAPE[Scrape IMPPAT]
+    SCRAPE -->|Success| ADMET[Extract ADMET from SwissADME Display]
+    SCRAPE -->|Error| FALLBACK[Use Local Cache]
+    
+    ADMET --> CYP_INHIBITOR[CYP Inhibitor Data ✓]
+    ADMET --> CYP_INDUCER_SEARCH[Web Search for Inducer Data]
+    
+    CYP_INDUCER_SEARCH --> PACKAGE[Create Evidence Package]
+    CYP_INHIBITOR --> PACKAGE
+    FALLBACK --> PACKAGE
+    WEBSEARCH --> PACKAGE
+    
+    PACKAGE --> OUTPUT[AYUSH Evidence with Sources]
+```
 
 **Key Methods:**
 ```python
-def normalize_medicine_name(name: str) -> NormalizedMedicine
-def identify_medicine_type(name: str) -> MedicineType
-def map_brand_to_generic(brand: str) -> str
-def extract_ingredients(formulation: str) -> List[str]
-def fuzzy_match_medicine(name: str, threshold: float) -> List[Match]
-def recognize_hindi_name(hindi_name: str) -> str
+class AYUSHDataAgent:
+    def gather(self, medicine_name: str) -> AYUSHEvidence:
+        """Main entry point for AYUSH data gathering"""
+        pass
+    
+    def lookup_local_db(self, common_name: str) -> Optional[AYUSHMedicine]:
+        """Lookup common name in local curated database"""
+        pass
+    
+    def get_phytochemical_links(self, scientific_name: str) -> List[str]:
+        """Get phytochemical page URLs from pre-extracted IMPPAT data"""
+        pass
+    
+    def scrape_imppat_admet(self, phyto_url: str) -> ADMETProperties:
+        """Scrape ADMET properties from IMPPAT (SwissADME display)"""
+        pass
+    
+    def search_cyp_inducers(self, herb_name: str) -> List[CYPInducerInfo]:
+        """Web search for CYP inducer research data"""
+        pass
+    
+    def get_fallback_data(self, medicine_name: str) -> Optional[AYUSHEvidence]:
+        """Retrieve from local cache when scraping fails"""
+        pass
 ```
 
 **Data Structures:**
 ```python
-class NormalizedMedicine:
-    standard_name: str
-    medicine_type: str  # "AYUSH" or "Allopathic"
-    system: Optional[str]  # For AYUSH: "Ayurveda", "Siddha", "Unani", "Homeopathy"
-    drug_class: Optional[str]  # For Allopathic
-    aliases: List[str]
-    active_ingredients: List[str]
-    effect_categories: List[str]
-    cyp450_interactions: Dict[str, str]
-    hindi_name: Optional[str]
+@dataclass
+class AYUSHEvidence:
+    medicine_name: str
+    scientific_name: str
+    system: str  # Ayurveda, Siddha, Unani, Homeopathy
+    phytochemicals: List[Phytochemical]
+    sources: List[SourceCitation]
+    data_source: str  # "realtime" or "cached"
+    
+@dataclass
+class Phytochemical:
+    name: str
+    smiles: Optional[str]
+    imppat_url: str
+    cyp_effects: Dict[str, CYPEffect]  # e.g., {"CYP3A4": CYPEffect(...)}
+    
+@dataclass
+class CYPEffect:
+    enzyme: str
+    is_inhibitor: bool
+    is_inducer: bool
+    is_substrate: bool
+    strength: str  # "strong", "moderate", "weak", "none"
+    evidence_type: str  # "in_vitro", "in_vivo", "predicted"
+    source_url: str
 ```
 
-**Input**: Raw medicine name from user, language context
-**Output**: Normalized medicine object with metadata, confidence score, alternative matches if ambiguous
+**Input**: AYUSH medicine name (common or scientific)
+**Output**: AYUSHEvidence with phytochemicals, CYP effects, and source URLs
 
-**Validates Requirements**: 1.2, 1.3, 1.4, 2.1, 2.2, 2.3, 2.4, 2.5, 6.4, 9.3, 10.5
+**Validates Requirements**: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 11.1, 11.2, 11.5
 
+### 3. Allopathy Data Agent
 
-### 3. Interaction Checker Agent
-
-**Purpose**: Evaluate potential interactions between medicines using a five-layer checking approach.
+**Purpose**: Gather comprehensive ADMET and CYP metabolism data for allopathic drugs through web search and scraping.
 
 **Responsibilities:**
-- Check curated interaction database (Layer 1)
-- Evaluate pharmacodynamic effect overlaps (Layer 2)
-- Infer CYP450 pathway interactions (Layer 3)
-- Search research literature via RAG (Layer 4)
-- Perform web search as fallback (Layer 5)
-- Calculate interaction severity
-- Generate all pairwise combinations for multiple medicines
-
-**Five-Layer Checking Approach:**
-
-1. **Layer 1 - Curated Database**: Direct lookup of known, documented interactions
-2. **Layer 2 - Pharmacodynamic Effects**: Check if medicines share effect categories (additive) or have opposing effects (antagonistic)
-3. **Layer 3 - CYP450 Pathways**: Evaluate metabolic pathway interactions (inhibitors, inducers, substrates)
-4. **Layer 4 - RAG Search**: Search research paper embeddings for documented cases
-5. **Layer 5 - Web Search**: Tavily API search as final fallback
+- Perform web search to resolve brand names to generic names
+- Scrape DrugBank.com or Drugs.com for CYP metabolism data
+- Search for additional CYP inducer information
+- Fallback to local cache on scraping errors
 
 **Key Methods:**
 ```python
-def check_all_pairs(medicines: List[NormalizedMedicine]) -> List[Interaction]
-def check_curated_database(med1: str, med2: str) -> Optional[Interaction]
-def check_pharmacodynamic_overlap(med1: NormalizedMedicine, med2: NormalizedMedicine) -> Optional[Interaction]
-def check_cyp450_interaction(med1: NormalizedMedicine, med2: NormalizedMedicine) -> Optional[Interaction]
-def search_research_literature(med1: str, med2: str) -> List[ResearchEvidence]
-def web_search_fallback(med1: str, med2: str) -> List[WebSearchResult]
-def calculate_severity(interaction: Interaction) -> SeverityLevel
+class AllopathyDataAgent:
+    def gather(self, drug_name: str) -> AllopathyEvidence:
+        """Main entry point for allopathy data gathering"""
+        pass
+    
+    def search_brand_to_generic(self, brand_name: str) -> DrugIdentity:
+        """Web search to find generic name and composition"""
+        pass
+    
+    def scrape_drugbank(self, generic_name: str) -> DrugMetabolism:
+        """Scrape DrugBank for CYP substrate/inhibitor/inducer data"""
+        pass
+    
+    def scrape_drugs_com(self, generic_name: str) -> DrugMetabolism:
+        """Alternative: scrape Drugs.com for metabolism data"""
+        pass
+    
+    def search_cyp_inducers(self, drug_name: str) -> List[CYPInducerInfo]:
+        """Web search for CYP inducer research data"""
+        pass
+    
+    def get_fallback_data(self, drug_name: str) -> Optional[AllopathyEvidence]:
+        """Retrieve from local cache when scraping fails"""
+        pass
 ```
 
 **Data Structures:**
 ```python
-class Interaction:
-    medicine_1: str
-    medicine_2: str
-    severity: str  # "Safe", "Caution", "Warning", "Danger"
-    interaction_type: str  # "Pharmacodynamic", "Pharmacokinetic", "Both"
-    mechanism: str
+@dataclass
+class AllopathyEvidence:
+    drug_name: str
+    generic_name: str
+    brand_names: List[str]
+    drug_class: str
+    metabolism: DrugMetabolism
+    sources: List[SourceCitation]
+    data_source: str  # "realtime" or "cached"
+
+@dataclass
+class DrugMetabolism:
+    cyp_substrates: List[str]  # e.g., ["CYP3A4", "CYP2D6"]
+    cyp_inhibitors: List[str]
+    cyp_inducers: List[str]
+    half_life: Optional[str]
+    protein_binding: Optional[str]
+    source_url: str
+```
+
+**Input**: Allopathic drug name (brand or generic)
+**Output**: AllopathyEvidence with CYP metabolism data and source URLs
+
+**Validates Requirements**: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 11.3
+
+### 4. Reasoning Agent
+
+**Purpose**: Analyze gathered evidence to determine drug interactions, detect conflicts, calculate severity, and generate grounded assessments.
+
+**Responsibilities:**
+- Analyze CYP pathway interactions (inhibitor/inducer/substrate relationships)
+- Detect pharmacodynamic overlaps (additive/antagonistic effects)
+- Search for research articles about the specific drug combination
+- Detect and report conflicting information from different sources
+- Calculate severity using rule-based scoring
+- Generate grounded assessment citing only provided evidence
+
+**Grounded Reasoning Flow:**
+```mermaid
+flowchart TD
+    INPUT[Evidence from Both Agents] --> CYP_ANALYSIS[CYP Pathway Analysis]
+    
+    CYP_ANALYSIS --> CHECK_INHIBIT{AYUSH inhibits CYP<br/>that metabolizes Drug?}
+    CHECK_INHIBIT -->|Yes| RISK_HIGH[Risk: Increased Drug Levels]
+    CHECK_INHIBIT -->|No| CHECK_INDUCE{AYUSH induces CYP<br/>that metabolizes Drug?}
+    
+    CHECK_INDUCE -->|Yes| RISK_LOW_EFF[Risk: Decreased Drug Efficacy]
+    CHECK_INDUCE -->|No| PD_ANALYSIS[Pharmacodynamic Analysis]
+    
+    PD_ANALYSIS --> CHECK_ADDITIVE{Overlapping Effects?}
+    CHECK_ADDITIVE -->|Yes| RISK_ADDITIVE[Risk: Additive Effect]
+    CHECK_ADDITIVE -->|No| RESEARCH_SEARCH[Search Research Articles]
+    
+    RISK_HIGH --> CONFLICT_CHECK
+    RISK_LOW_EFF --> CONFLICT_CHECK
+    RISK_ADDITIVE --> CONFLICT_CHECK
+    RESEARCH_SEARCH --> CONFLICT_CHECK
+    
+    CONFLICT_CHECK[Conflict Detection] --> HAS_CONFLICT{Sources Conflict?}
+    HAS_CONFLICT -->|Yes| RESOLVE[Apply Evidence Hierarchy]
+    HAS_CONFLICT -->|No| SEVERITY
+    RESOLVE --> SEVERITY
+    
+    SEVERITY[Rule-based Severity Scoring] --> GENERATE[Generate Grounded Assessment]
+    GENERATE --> OUTPUT[Interaction Report with Citations]
+```
+
+**Conflict Detection Logic:**
+```python
+class ConflictType(Enum):
+    NO_CONFLICT = "no_conflict"
+    DIRECT_CONTRADICTION = "direct_contradiction"
+    MAGNITUDE_DISAGREEMENT = "magnitude_disagreement"
+    EVIDENCE_QUALITY_GAP = "evidence_quality_gap"
+    INSUFFICIENT_DATA = "insufficient_data"
+
+def detect_conflicts(evidence_items: List[EvidenceItem]) -> ConflictAnalysis:
+    """
+    Analyze gathered evidence for conflicts
+    """
+    safe_claims = [e for e in evidence_items if e.direction == "safe"]
+    risk_claims = [e for e in evidence_items if e.direction == "risk"]
+    
+    # Direct contradiction: some say safe, others say risk
+    if safe_claims and risk_claims:
+        return ConflictAnalysis(
+            conflict_type=ConflictType.DIRECT_CONTRADICTION,
+            resolution_strategy="Apply evidence hierarchy",
+            explanation="Sources disagree on safety"
+        )
+    
+    # Magnitude disagreement: all say risk but different severity
+    if len(risk_claims) > 1:
+        severities = set(e.severity for e in risk_claims)
+        if len(severities) > 1:
+            return ConflictAnalysis(
+                conflict_type=ConflictType.MAGNITUDE_DISAGREEMENT,
+                resolution_strategy="Use highest quality source",
+                explanation="Sources agree on risk but disagree on severity"
+            )
+    
+    return ConflictAnalysis(conflict_type=ConflictType.NO_CONFLICT)
+```
+
+**Severity Calculation (Rule-based):**
+```python
+EVIDENCE_WEIGHTS = {
+    "clinical_study": 1.0,
+    "in_vivo": 0.8,
+    "in_vitro": 0.6,
+    "predicted": 0.4,
+    "traditional": 0.3
+}
+
+def calculate_severity(
+    cyp_interaction: Optional[CYPInteraction],
+    pd_interaction: Optional[PDInteraction],
+    clinical_reports: int,
+    evidence_quality: str
+) -> SeverityResult:
+    """Rule-based severity calculation"""
+    
+    score = 0
+    reasons = []
+    
+    # CYP interaction scoring
+    if cyp_interaction:
+        if cyp_interaction.type == "inhibitor":
+            if cyp_interaction.strength == "strong":
+                score += 3
+                reasons.append("Strong CYP inhibition - significant increase in drug levels")
+            elif cyp_interaction.strength == "moderate":
+                score += 2
+                reasons.append("Moderate CYP inhibition - may increase drug levels")
+        elif cyp_interaction.type == "inducer":
+            if cyp_interaction.strength == "strong":
+                score += 3
+                reasons.append("Strong CYP induction - significant decrease in drug efficacy")
+            elif cyp_interaction.strength == "moderate":
+                score += 2
+                reasons.append("Moderate CYP induction - may decrease drug efficacy")
+    
+    # Pharmacodynamic scoring
+    if pd_interaction:
+        if pd_interaction.type == "additive":
+            score += 2
+            reasons.append(f"Additive {pd_interaction.effect} effect")
+    
+    # Clinical evidence boost
+    if clinical_reports > 0:
+        score += min(clinical_reports, 3)
+        reasons.append(f"{clinical_reports} clinical case report(s)")
+    
+    # Evidence quality adjustment
+    adjusted_score = score * EVIDENCE_WEIGHTS.get(evidence_quality, 0.5)
+    
+    # Map to severity
+    if adjusted_score >= 4:
+        severity = "HIGH"
+        recommendation = "AVOID or use only under medical supervision"
+    elif adjusted_score >= 2:
+        severity = "MODERATE"
+        recommendation = "Use with caution, monitor for effects"
+    elif adjusted_score >= 1:
+        severity = "LOW"
+        recommendation = "Generally safe, be aware of potential effects"
+    else:
+        severity = "NONE"
+        recommendation = "No significant interaction expected"
+    
+    return SeverityResult(
+        level=severity,
+        score=adjusted_score,
+        reasons=reasons,
+        recommendation=recommendation
+    )
+```
+
+**Grounded Response Prompt Template:**
+```python
+GROUNDED_REASONING_PROMPT = """
+You are analyzing drug interactions. Your response must be STRICTLY GROUNDED in the provided evidence.
+
+## CRITICAL RULES:
+1. ONLY use information from the sources provided below
+2. If sources conflict, explicitly state the conflict and which source you're prioritizing
+3. If information is missing, say "Data not available" - DO NOT infer or assume
+4. Every factual claim must cite a source URL
+5. Never claim safety without clinical evidence
+6. When uncertain, recommend consulting a healthcare provider
+
+## EVIDENCE PROVIDED:
+
+### AYUSH Medicine: {ayush_name}
+{ayush_evidence_json}
+
+### Allopathic Drug: {allopathy_name}
+{allopathy_evidence_json}
+
+### Research Articles Found:
+{research_json}
+
+## ANALYSIS REQUIRED:
+
+1. CYP Pathway Analysis: Does the AYUSH medicine affect CYP enzymes that metabolize the drug?
+2. Pharmacodynamic Analysis: Do they have overlapping or opposing effects?
+3. Conflict Check: Do sources disagree? If yes, note this explicitly.
+4. Assessment: Based ONLY on provided evidence.
+
+## OUTPUT:
+Provide your analysis in JSON format with source citations for every claim.
+"""
+```
+
+**Input**: AYUSHEvidence, AllopathyEvidence
+**Output**: InteractionReport with severity, mechanisms, conflicts, and source citations
+
+**Validates Requirements**: 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 16.1, 16.2, 16.3, 16.4, 16.5, 17.1, 17.2, 17.3, 17.4, 17.5
+
+### 5. Professional Formatter Agent
+
+**Purpose**: Format the Reasoning Agent's output into structured data suitable for rendering in the professional web UI, including organized sections for drug profiles, ADMET comparison, interaction mechanisms, and source citations.
+
+**Responsibilities:**
+- Structure the interaction report into UI-renderable sections
+- Organize drug profiles with phytochemical/compound details
+- Create ADMET property comparison tables
+- Format CYP enzyme interaction data
+- Organize all source citations with clickable URLs
+- Highlight conflicts and their resolution
+- Generate technical summary for medical professionals
+
+**Key Methods:**
+```python
+class ProfessionalFormatterAgent:
+    def format(self, interaction_report: InteractionReport) -> ProfessionalUIData:
+        """Format interaction report for web UI rendering"""
+        pass
+    
+    def format_drug_profile(self, evidence: Union[AYUSHEvidence, AllopathyEvidence]) -> DrugProfileSection:
+        """Create structured drug profile section"""
+        pass
+    
+    def format_admet_comparison(self, ayush: AYUSHEvidence, allo: AllopathyEvidence) -> ADMETComparisonTable:
+        """Create side-by-side ADMET comparison"""
+        pass
+    
+    def format_cyp_analysis(self, cyp_analysis: CYPAnalysis) -> CYPAnalysisSection:
+        """Format CYP interaction details"""
+        pass
+    
+    def format_source_citations(self, sources: List[SourceCitation]) -> SourcesSection:
+        """Organize all sources with URLs"""
+        pass
+    
+    def format_conflict_disclosure(self, conflict: ConflictAnalysis) -> Optional[ConflictSection]:
+        """Format conflict information if present"""
+        pass
+    
+    def generate_technical_summary(self, report: InteractionReport) -> str:
+        """Generate medical professional-oriented summary"""
+        pass
+```
+
+**Data Structures:**
+```python
+@dataclass
+class ProfessionalUIData:
+    """Structured data for web UI rendering"""
+    header: HeaderSection
+    ayush_profile: DrugProfileSection
+    allopathy_profile: DrugProfileSection
+    admet_comparison: ADMETComparisonTable
+    cyp_analysis: CYPAnalysisSection
+    pd_analysis: Optional[PDAnalysisSection]
+    severity_assessment: SeveritySection
+    conflict_disclosure: Optional[ConflictSection]
     clinical_effects: List[str]
     recommendations: List[str]
-    evidence_level: str  # "High", "Medium", "Low"
-    evidence_sources: List[str]
-    effect_type: Optional[str]  # "Additive", "Antagonistic", "Synergistic"
+    sources: SourcesSection
+    technical_summary: str
+    disclaimer: str
+
+@dataclass
+class DrugProfileSection:
+    name: str
+    scientific_name: Optional[str]
+    type: str  # "AYUSH" or "Allopathic"
+    system_or_class: str
+    compounds: List[CompoundInfo]  # Phytochemicals or active ingredients
+    effect_categories: List[str]
+    data_source: str  # "realtime" or "cached"
+    source_url: str
+
+@dataclass
+class ADMETComparisonTable:
+    rows: List[ADMETRow]
+    
+@dataclass
+class ADMETRow:
+    property_name: str  # e.g., "CYP3A4 Inhibitor"
+    ayush_value: str
+    allopathy_value: str
+    interaction_flag: bool  # True if this creates potential interaction
+
+@dataclass
+class SourcesSection:
+    imppat_sources: List[SourceLink]
+    drugbank_sources: List[SourceLink]
+    research_sources: List[SourceLink]
+    web_search_sources: List[SourceLink]
+
+@dataclass
+class SourceLink:
+    title: str
+    url: str
+    evidence_type: str
+    data_used: str
 ```
 
-**Severity Calculation Logic:**
+**Professional Formatter Prompt Template:**
 ```python
-def calculate_severity(interaction: Interaction) -> str:
-    if "life-threatening" in interaction.clinical_effects:
-        return "Danger"
-    
-    if interaction.evidence_level == "High":
-        if interaction.interaction_type in ["Pharmacodynamic", "Pharmacokinetic"]:
-            if interaction.effect_type == "Additive":
-                return "Warning"
-    
-    if "inferred" in interaction.evidence_sources:
-        return "Caution"
-    
-    return "Safe"
+PROFESSIONAL_FORMATTER_PROMPT = """
+You are formatting a drug interaction analysis for AYUSH medical professionals.
+
+The output must be:
+1. Technical and detailed - professionals need complete information
+2. Well-organized with clear sections
+3. Include ALL source URLs as clickable links
+4. Highlight any conflicts between sources
+5. Provide a technical summary suitable for clinical decision-making
+
+Input data:
+{interaction_report_json}
+
+Generate a structured technical summary that:
+- Uses proper medical terminology
+- Explains the mechanism of interaction clearly
+- Notes the evidence quality for each finding
+- Identifies any limitations in the available data
+
+Format the summary for medical professionals who understand pharmacology.
+"""
 ```
 
-**Input**: List of normalized medicines
-**Output**: List of interactions with severity levels and evidence sources
+**Input**: InteractionReport from Reasoning Agent
+**Output**: ProfessionalUIData structured for web UI rendering
 
-**Validates Requirements**: 3.1, 3.2, 3.3, 3.4, 3.5, 4.1, 4.2, 4.3, 7.1, 9.4, 10.2, 11.1, 11.3, 11.4, 11.5, 12.2, 12.3, 15.1, 15.2, 15.3, 15.4, 15.5
+**Validates Requirements**: 8.1, 8.2, 8.3, 8.4, 8.5, 8.6
 
+---
 
-### 4. Explanation Agent
+### 6. Communicator Agent
 
-**Purpose**: Generate patient-friendly explanations, translate to Hindi, and format responses for different channels.
+**Purpose**: Generate patient-friendly summaries in the user's preferred language for the chat interface.
 
 **Responsibilities:**
-- Generate plain-language explanations of interaction mechanisms
-- Describe observable symptoms and effects
-- Provide actionable recommendations
-- Translate content to Hindi when requested
-- Format responses for WhatsApp (with emojis) or web
-- Add appropriate medical disclaimers
-- Generate shareable reports
+- Detect user's language from input (Hindi, English, Hinglish, regional)
+- Summarize interaction assessment in 4-5 simple sentences
+- Use simple vocabulary avoiding technical jargon
+- Match the tone and language of the user's input
+- Include actionable advice appropriate for patients
 
 **Key Methods:**
 ```python
-def generate_explanation(interaction: Interaction, language: str) -> str
-def translate_to_hindi(text: str) -> str
-def format_for_channel(response: str, channel: str) -> str
-def add_disclaimer(severity: str) -> str
-def generate_report(interactions: List[Interaction], medicines: List[str]) -> str
-def format_severity_indicator(severity: str, channel: str) -> str
-```
-
-**Input**: Interaction details, language preference, output channel
-**Output**: Formatted, user-friendly explanation with disclaimers
-
-**Validates Requirements**: 4.5, 5.1, 5.2, 5.3, 5.4, 5.5, 6.1, 6.2, 6.3, 6.5, 9.5, 13.1, 13.2, 13.3, 14.2, 14.3, 16.1, 16.2, 16.3, 16.4, 16.5
-
-### 5. Interface Layer
-
-**WhatsApp Interface:**
-```python
-class WhatsAppInterface:
-    def receive_message(self, from_number: str, message: str) -> None:
-        session_id = self.get_or_create_session(from_number)
-        response = orchestrator.process_message(message, session_id, channel="whatsapp")
-        self.send_message(from_number, response)
+class CommunicatorAgent:
+    def summarize(
+        self, 
+        interaction_report: InteractionReport, 
+        user_message: str
+    ) -> str:
+        """Generate patient-friendly summary"""
+        pass
     
-    def send_message(self, to_number: str, message: str) -> None:
-        # Format with emoji indicators
-        # Handle WhatsApp message length limits
-        self.twilio_client.messages.create(...)
+    def detect_language(self, text: str) -> str:
+        """Detect language: en, hi, hinglish, regional"""
+        pass
+    
+    def simplify_medical_term(self, term: str, language: str) -> str:
+        """Convert medical term to simple language"""
+        pass
+    
+    def generate_action_advice(
+        self, 
+        severity: str, 
+        language: str
+    ) -> str:
+        """Generate appropriate action advice"""
+        pass
 ```
 
-**Web Interface:**
+**Communicator Prompt Template:**
 ```python
-class WebInterface:
-    def render_chat(self):
-        # Display conversation history
-        # Input box for user message
-        # Send button
-        # Display formatted responses with severity colors
+COMMUNICATOR_PROMPT = """
+You are a friendly health assistant helping a patient understand medicine interactions.
+
+User's message was in: {detected_language}
+User's tone: {detected_tone}
+
+Interaction assessment:
+- Medicines: {medicine_1} + {medicine_2}
+- Severity: {severity}
+- Key finding: {main_finding}
+
+Generate a response that:
+1. Is in the SAME language and tone as the user
+2. Is 4-5 sentences maximum
+3. Uses simple, everyday words (no medical jargon)
+4. Gives clear, actionable advice
+5. Does not cause unnecessary alarm
+
+If severity is MODERATE or HIGH, advise talking to a doctor.
+If severity is LOW or NONE, provide reassurance with general caution.
+
+Respond directly to the patient:
+"""
 ```
 
-**Validates Requirements**: 14.1, 14.4, 14.5
+**Language Response Examples:**
 
+| User Input | Detected | Response Style |
+|------------|----------|----------------|
+| "Is metformin safe with ashwagandha?" | English | Clear, simple English |
+| "क्या मेटफॉर्मिन अश्वगंधा के साथ ले सकते हैं?" | Hindi | Formal Hindi |
+| "metformin aur ashwagandha sath le sakte hai kya?" | Hinglish | Hinglish response |
+
+**Input**: InteractionReport, User message
+**Output**: 4-5 sentence patient-friendly response in user's language
+
+**Validates Requirements**: 9.1, 9.2, 9.3, 9.4, 9.5, 9.6
 
 ## Data Models
 
-### Database Schema Overview
+### Source Citation Model
 
-```mermaid
-erDiagram
-    ALLOPATHIC_DRUGS ||--o{ BRAND_MAPPINGS : "has brands"
-    AYUSH_MEDICINES ||--o{ BRAND_MAPPINGS : "has brands"
-    ALLOPATHIC_DRUGS }o--o{ INTERACTIONS : "participates in"
-    AYUSH_MEDICINES }o--o{ INTERACTIONS : "participates in"
-    
-    ALLOPATHIC_DRUGS {
-        int id PK
-        string standard_name
-        string generic_name
-        string drug_class
-        string mechanism
-        json cyp450_substrate
-        json cyp450_inhibitor
-        json cyp450_inducer
-        json effect_categories
-        json aliases
-    }
-    
-    AYUSH_MEDICINES {
-        int id PK
-        string standard_name
-        string system
-        string sanskrit_name
-        string hindi_name
-        json active_ingredients
-        string traditional_uses
-        json effect_categories
-        json aliases
-    }
-    
-    BRAND_MAPPINGS {
-        int id PK
-        string brand_name
-        string generic_name
-        string manufacturer
-        string medicine_type
-    }
-    
-    INTERACTIONS {
-        string id PK
-        string medicine_1
-        string medicine_2
-        string severity
-        string interaction_type
-        string mechanism
-        json clinical_effects
-        json recommendations
-        string evidence_level
-        json sources
-    }
+```python
+@dataclass
+class SourceCitation:
+    source_id: str
+    source_type: str  # "IMPPAT", "DrugBank", "Drugs.com", "PubMed", "WebSearch"
+    url: str
+    accessed_at: datetime
+    data_extracted: str  # What specific data was taken from this source
+    evidence_quality: str  # "clinical", "in_vivo", "in_vitro", "predicted"
+    confidence: float  # 0.0 to 1.0
 ```
 
-### Database Schema
+### Evidence Item Model
 
-**Allopathic Drugs Table:**
-```sql
-CREATE TABLE allopathic_drugs (
-    id INTEGER PRIMARY KEY,
-    standard_name TEXT NOT NULL,
-    generic_name TEXT,
-    drug_class TEXT,
-    mechanism TEXT,
-    common_uses TEXT,
-    cyp450_substrate TEXT,  -- JSON array
-    cyp450_inhibitor TEXT,  -- JSON array
-    cyp450_inducer TEXT,    -- JSON array
-    effect_categories TEXT, -- JSON array
-    aliases TEXT            -- JSON array
-);
+```python
+@dataclass
+class EvidenceItem:
+    source: SourceCitation
+    claim: str
+    direction: str  # "safe", "risk", "unknown"
+    severity: Optional[str]  # "LOW", "MODERATE", "HIGH"
+    mechanism: Optional[str]
+    conditions: Optional[str]  # "at doses > 500mg", "with ethanol extract"
 ```
 
-**AYUSH Medicines Table:**
-```sql
-CREATE TABLE ayush_medicines (
-    id INTEGER PRIMARY KEY,
-    standard_name TEXT NOT NULL,
-    system TEXT,  -- Ayurveda, Siddha, Unani, Homeopathy
-    sanskrit_name TEXT,
-    hindi_name TEXT,
-    active_ingredients TEXT,  -- JSON array
-    traditional_uses TEXT,
-    pharmacodynamics TEXT,
-    effect_categories TEXT,   -- JSON array
-    aliases TEXT              -- JSON array
-);
+### Interaction Report Model
+
+```python
+@dataclass
+class InteractionReport:
+    query_id: str
+    ayush_medicine: str
+    allopathy_drug: str
+    
+    # Evidence gathered
+    ayush_evidence: AYUSHEvidence
+    allopathy_evidence: AllopathyEvidence
+    research_findings: List[ResearchFinding]
+    
+    # Analysis
+    cyp_analysis: CYPAnalysis
+    pd_analysis: Optional[PDAnalysis]
+    conflict_analysis: ConflictAnalysis
+    
+    # Assessment
+    severity: SeverityResult
+    mechanisms: List[str]
+    clinical_effects: List[str]
+    recommendations: List[str]
+    
+    # Traceability
+    all_sources: List[SourceCitation]
+    reasoning_chain: str  # LLM's step-by-step reasoning
+    
+    # Metadata
+    generated_at: datetime
+    data_sources_used: List[str]  # "realtime" or "cached" for each
 ```
 
-**Brand Name Mapping Table:**
-```sql
-CREATE TABLE brand_mappings (
-    id INTEGER PRIMARY KEY,
-    brand_name TEXT NOT NULL,
-    generic_name TEXT NOT NULL,
-    manufacturer TEXT,
-    medicine_type TEXT  -- "AYUSH" or "Allopathic"
-);
-```
+### Local Database Schema
 
-### Curated Interactions (JSON)
-
+**AYUSH Medicines (JSON):**
 ```json
 {
-  "interactions": [
+  "medicines": [
     {
-      "id": "INT001",
-      "medicine_1": {
-        "name": "Ashwagandha",
-        "type": "AYUSH",
-        "system": "Ayurveda"
+      "common_names": ["Ashwagandha", "Indian Ginseng", "अश्वगंधा"],
+      "scientific_name": "Withania somnifera",
+      "system": "Ayurveda",
+      "phytochemical_links": [
+        "https://cb.imsc.res.in/imppat/phytochemical/IMPHY001234"
+      ],
+      "cached_admet": {
+        "phytochemicals": [
+          {
+            "name": "Withaferin A",
+            "cyp_effects": {
+              "CYP3A4": {"inhibitor": false, "inducer": true, "strength": "moderate"},
+              "CYP2D6": {"inhibitor": true, "inducer": false, "strength": "weak"}
+            }
+          }
+        ]
       },
-      "medicine_2": {
-        "name": "Metformin",
-        "type": "Allopathic",
-        "class": "Biguanide"
-      },
-      "interaction": {
-        "severity": "Warning",
-        "type": "Pharmacodynamic",
-        "mechanism": "Additive hypoglycemic effect",
-        "clinical_effects": ["Hypoglycemia", "Shakiness", "Sweating"],
-        "recommendations": [
-          "Monitor blood glucose closely",
-          "Keep glucose source available"
-        ],
-        "evidence_level": "Medium",
-        "sources": ["Drugs.com", "PMID:12345678"]
-      }
+      "effect_categories": ["blood_sugar_lowering", "adaptogen", "sedation"]
     }
   ]
 }
 ```
 
-### Effect Categories (JSON)
-
+**Allopathic Drugs (JSON):**
 ```json
 {
-  "effect_categories": {
-    "blood_sugar_lowering": {
-      "description": "Medicines that reduce blood glucose levels",
-      "allopathic": ["Metformin", "Glipizide", "Insulin"],
-      "ayush": ["Ashwagandha", "Gymnema", "Bitter Melon"],
-      "opposes": "blood_sugar_raising"
-    },
-    "blood_thinning": {
-      "description": "Medicines with anticoagulant or antiplatelet effects",
-      "allopathic": ["Warfarin", "Aspirin", "Clopidogrel"],
-      "ayush": ["Turmeric", "Garlic", "Ginger"],
-      "opposes": null
-    },
-    "sedation_cns_depression": {
-      "description": "Medicines that cause drowsiness or CNS depression",
-      "allopathic": ["Alprazolam", "Zolpidem", "Codeine"],
-      "ayush": ["Valerian", "Brahmi", "Jatamansi"],
-      "opposes": "cns_stimulation"
+  "drugs": [
+    {
+      "generic_name": "Metformin",
+      "brand_names": ["Glycomet", "Glucophage", "Obimet"],
+      "drug_class": "Biguanide",
+      "cached_metabolism": {
+        "cyp_substrates": [],
+        "cyp_inhibitors": [],
+        "cyp_inducers": [],
+        "notes": "Metformin is not significantly metabolized by CYP enzymes"
+      },
+      "effect_categories": ["blood_sugar_lowering"],
+      "drugbank_url": "https://go.drugbank.com/drugs/DB00331"
     }
-  }
+  ]
 }
 ```
 
-### CYP450 Rules (JSON)
-
+**Curated Interactions (JSON):**
 ```json
 {
-  "cyp450_pathways": {
-    "CYP3A4": {
-      "substrates": ["Simvastatin", "Amlodipine", "Alprazolam"],
-      "inhibitors": ["Grapefruit", "Ketoconazole"],
-      "inducers": ["Rifampin", "St. John's Wort"],
-      "interaction_rule": "Inhibitor + Substrate = Increased substrate levels (Warning)"
+  "interactions": [
+    {
+      "id": "INT001",
+      "ayush_medicine": "Ashwagandha",
+      "allopathy_drug": "Metformin",
+      "severity": "MODERATE",
+      "mechanism": "Additive hypoglycemic effect",
+      "evidence": [
+        {
+          "type": "pharmacodynamic",
+          "description": "Both lower blood sugar through different mechanisms",
+          "source": "Inferred from effect categories"
+        },
+        {
+          "type": "clinical",
+          "description": "Case reports of hypoglycemia in diabetic patients",
+          "source": "https://pubmed.ncbi.nlm.nih.gov/12345678/"
+        }
+      ],
+      "clinical_effects": ["Hypoglycemia", "Shakiness", "Sweating", "Confusion"],
+      "recommendations": [
+        "Monitor blood glucose more frequently",
+        "Keep glucose tablets available",
+        "Inform your doctor about Ashwagandha use"
+      ]
     }
-  }
+  ]
 }
 ```
-
 
 ## Correctness Properties
 
-*A property is a characteristic or behavior that should hold true across all valid executions of a system—essentially, a formal statement about what the system should do. Properties serve as the bridge between human-readable specifications and machine-verifiable correctness guarantees.*
+### Property 1: Grounded Response Constraint
+*For any* interaction assessment generated by the Reasoning Agent, every factual claim must cite a source from the provided evidence; no claims based on LLM internal knowledge are permitted
+**Validates: Requirements 5.1, 7.1**
 
-### Property 1: Medicine name normalization consistency
-*For any* medicine name and its known aliases, normalizing any alias should produce the same standard name
-**Validates: Requirements 1.2, 2.5**
+### Property 2: Conflict Detection Completeness
+*For any* set of evidence items where at least one claims "safe" and another claims "risk", the system must detect and report the conflict
+**Validates: Requirements 5.3, 5.4**
 
-### Property 2: Medicine type classification completeness
-*For any* medicine in the database, it should be classified as exactly one type (AYUSH or Allopathic)
-**Validates: Requirements 2.1**
+### Property 3: Evidence Hierarchy Application
+*For any* conflict resolution, sources must be prioritized: Clinical Study > In Vivo > In Vitro > Computational Prediction > Traditional Knowledge
+**Validates: Requirements 5.4**
 
-### Property 3: AYUSH system classification
-*For any* AYUSH medicine, it should have exactly one system classification (Ayurveda, Siddha, Unani, or Homeopathy)
-**Validates: Requirements 2.2**
+### Property 4: Source Citation Completeness
+*For any* interaction report, all sources used (IMPPAT URLs, DrugBank URLs, research article URLs) must be included with clickable links
+**Validates: Requirements 7.1, 7.2, 7.3, 7.4, 8.5**
 
-### Property 4: Pairwise interaction checking completeness
-*For any* list of N medicines where N ≥ 2, the system should check exactly N*(N-1)/2 unique pairs for interactions
-**Validates: Requirements 3.1, 7.1**
+### Property 5: Parallel Execution
+*For any* query with both AYUSH and allopathic medicines, the data gathering agents must execute in parallel, not sequentially
+**Validates: Requirements 4.1, 4.2**
 
-### Property 5: Interaction checking layer cascade
-*For any* medicine pair, if Layer 1 (curated database) returns no result, then Layer 2 (pharmacodynamic) should be invoked; if Layer 2 returns no result, then Layer 3 (CYP450) should be invoked; if Layer 3 returns no result, then Layer 4 (RAG) should be invoked
-**Validates: Requirements 3.2, 3.3, 3.4, 3.5**
+### Property 6: Fallback Activation
+*For any* web scraping error, the system must automatically fallback to local cached data without user-visible error messages
+**Validates: Requirements 2.5, 3.5, 12.1**
 
-### Property 6: Interaction severity ordering
-*For any* list of interactions, when presented to the user, they should be ordered by severity: Danger > Warning > Caution > Safe
-**Validates: Requirements 4.4**
+### Property 7: Severity Score Determinism
+*For any* given set of inputs (CYP interaction, PD interaction, clinical reports, evidence quality), the rule-based severity calculation must produce the same result
+**Validates: Requirements 6.1, 6.2**
 
-### Property 7: Interaction schema completeness
-*For any* interaction found, it should contain all required fields: medicine_1, medicine_2, severity (one of: Safe/Caution/Warning/Danger), mechanism, clinical_effects, recommendations, evidence_level (High/Medium/Low), and evidence_sources
-**Validates: Requirements 4.1, 11.1, 11.5**
+### Property 8: Patient Response Length
+*For any* patient chat response, the Communicator Agent output must be 4-5 sentences maximum
+**Validates: Requirements 9.3**
 
-### Property 8: High-severity disclaimer presence
-*For any* interaction with severity Warning or Danger, the explanation should include both urgent action recommendations and explicit advice to consult a healthcare provider
-**Validates: Requirements 4.5, 13.2**
-
-### Property 9: Explanation completeness
-*For any* interaction, the generated explanation should contain: mechanism description, observable symptoms/effects, and actionable recommendations
-**Validates: Requirements 5.1, 5.2, 5.3**
-
-### Property 10: Evidence citation completeness
-*For any* interaction with evidence from research papers, the citation should include either a PubMed ID or DOI
-**Validates: Requirements 5.4, 11.2**
-
-### Property 11: Hindi translation completeness
-*For any* interaction explanation requested in Hindi, the output should contain Hindi characters and include both Hindi medicine names (when available) and standard medical names
-**Validates: Requirements 6.1, 6.3**
-
-### Property 12: Hindi severity translation
-*For any* severity level displayed in Hindi, it should map to the correct Hindi equivalent: Safe→सुरक्षित, Caution→सावधानी, Warning→चेतावनी, Danger→खतरा
-**Validates: Requirements 6.5**
-
-### Property 13: Hindi input recognition
-*For any* medicine with a Hindi name in the database, providing the Hindi name as input should resolve to the same standard medicine as providing the English name
-**Validates: Requirements 6.4**
-
-### Property 14: Multiple interaction summary completeness
-*For any* set of interactions found, the summary should include all interactions grouped by severity level
-**Validates: Requirements 7.2, 7.3**
-
-### Property 15: Conversation context persistence
-*For any* conversation session, information from previous turns should be accessible in subsequent turns within the same session
-**Validates: Requirements 8.1, 8.3**
-
-### Property 16: Clarification request on ambiguity
-*For any* medicine identification with confidence below threshold (e.g., 0.7), the system should request clarification and present multiple options
-**Validates: Requirements 1.5, 10.5**
-
-### Property 17: Agent routing exclusivity
-*For any* single request from the Orchestrator, exactly one specialist agent should be invoked at a time
-**Validates: Requirements 9.1**
-
-### Property 18: Agent response structure
-*For any* specialist agent response, it should conform to a structured schema with defined fields (not free-form text)
+### Property 9: Language Matching
+*For any* patient input in Hindi, Hinglish, or regional language, the Communicator Agent response must be in the same language
 **Validates: Requirements 9.2**
 
-### Property 19: Agent responsibility separation
-*For any* agent execution, the Medicine Identifier should not check interactions, the Interaction Checker should not generate user-facing text, and the Explanation Agent should not identify medicines or check interactions
-**Validates: Requirements 9.3, 9.4, 9.5**
+### Property 10: Flow Routing Correctness
+*For any* request from web UI, the Professional Flow must be used; for any request from chat UI, the Patient Flow must be used
+**Validates: Requirements 10.5**
 
-### Property 20: Error message user-friendliness
-*For any* system error, the message presented to the user should not contain stack traces or technical error codes
-**Validates: Requirements 10.3**
+### Property 11: CYP Inducer Search
+*For any* AYUSH medicine, after scraping IMPPAT for inhibitor data, the system must perform web search for inducer data
+**Validates: Requirements 2.4**
 
-### Property 21: Graceful degradation with cached data
-*For any* external data source failure, the system should continue operating using cached data and inform the user of reduced functionality
-**Validates: Requirements 10.4**
+### Property 12: Insufficient Data Handling
+*For any* query where evidence is insufficient to determine interaction, the system must report "UNKNOWN - Limited data" rather than inferring safety
+**Validates: Requirements 5.6**
 
-### Property 22: Inferred interaction labeling
-*For any* interaction identified through pharmacodynamic effect matching or CYP450 inference (not curated database), it should be clearly labeled as "inferred" in the evidence sources
-**Validates: Requirements 11.3, 15.5**
-
-### Property 23: CYP450 pathway specification
-*For any* interaction identified through CYP450 pathways, the interaction details should specify which enzyme pathway is involved (e.g., CYP3A4, CYP2D6)
-**Validates: Requirements 11.4**
-
-### Property 24: Curated database query performance
-*For any* medicine pair query to the curated database, the response time should be under 100 milliseconds
-**Validates: Requirements 12.2**
-
-### Property 25: Curated database prioritization
-*For any* medicine pair that exists in the curated database, the curated data should be used as the primary source, and other checking layers should not override it
-**Validates: Requirements 12.3**
-
-### Property 26: Hot-reload capability
-*For any* update to the curated interaction database file, the system should reload the data within 5 seconds without requiring a restart
-**Validates: Requirements 12.4**
-
-### Property 27: Universal disclaimer presence
-*For any* interaction result displayed, it should include a disclaimer stating the information is for informational purposes only and does not replace professional medical advice
-**Validates: Requirements 13.1**
-
-### Property 28: Prohibited recommendation content
-*For any* recommendation generated, it should not contain phrases advising to stop medication or change dosage without consulting a healthcare provider
-**Validates: Requirements 13.3**
-
-### Property 29: Out-of-scope redirection
-*For any* user question about medical advice beyond interaction checking (e.g., diagnosis, treatment), the system should redirect to consult a healthcare professional
-**Validates: Requirements 13.4**
-
-### Property 30: WhatsApp emoji severity indicators
-*For any* interaction result sent via WhatsApp, the severity should be indicated with the correct emoji: 🟢 for Safe, 🟡 for Caution, 🟠 for Warning, 🔴 for Danger
-**Validates: Requirements 14.3**
-
-### Property 31: WhatsApp message routing
-*For any* message received via WhatsApp, it should be processed through the Orchestrator Agent using the same logic as web interface messages
+### Property 13: Disclaimer Presence
+*For any* interaction result displayed, a medical disclaimer must be included
 **Validates: Requirements 14.1**
 
-### Property 32: Session timeout duration
-*For any* conversation session, context should be maintained for at least 30 minutes of inactivity before expiring
-**Validates: Requirements 14.4**
+### Property 14: High Severity Consultation Advice
+*For any* interaction with severity MODERATE or HIGH, the response must include explicit advice to consult a healthcare provider
+**Validates: Requirements 6.6, 14.2**
 
-### Property 33: Interface feature parity
-*For any* core functionality (medicine identification, interaction checking, explanation generation), both WhatsApp and web interfaces should support it
-**Validates: Requirements 14.5**
-
-### Property 34: Effect category assignment
-*For any* medicine in the database, it should be assigned to at least one effect category from the defined set
-**Validates: Requirements 15.1**
-
-### Property 35: Additive interaction detection
-*For any* two medicines that share at least one effect category, the Interaction Checker should flag a potential additive interaction
-**Validates: Requirements 15.2**
-
-### Property 36: Antagonistic interaction detection
-*For any* two medicines that have opposing effect categories, the Interaction Checker should flag a potential antagonistic interaction
-**Validates: Requirements 15.3**
-
-### Property 37: AYUSH effect category inference
-*For any* AYUSH medicine without a pre-assigned effect category, the system should attempt to infer the effect category from its traditional uses and known active compounds before reporting "unknown"
-**Validates: Requirements 15.4**
-
-### Property 38: Progress indicator for complex checks
-*For any* interaction check involving 4 or more medicines, the Orchestrator should send at least one progress update to the user before the final response
-**Validates: Requirements 7.5**
-
-### Property 39: Report generation completeness
-*For any* report generated, it should include: all medicine names checked, all interactions found, severity levels, evidence sources, timestamp, and healthcare provider consultation recommendation
-**Validates: Requirements 16.1, 16.2, 16.4, 16.5**
-
-### Property 40: Report shareability format
-*For any* report generated, it should be formatted as plain text or markdown suitable for copying, forwarding, or printing
-**Validates: Requirements 16.3**
-
+### Property 15: Conflict Transparency
+*For any* detected conflict between sources, the conflict must be explicitly mentioned in the output with source attribution
+**Validates: Requirements 5.5, 8.6**
 
 ## Error Handling
 
 ### Error Categories and Responses
 
-**1. Medicine Not Found**
-- **Trigger**: Medicine name not in any database and fuzzy matching fails
-- **Response**: "I couldn't find [medicine name] in my database. Could you check the spelling or try a different name? I can also search the web for information."
-- **Fallback**: Offer Tavily web search
-- **Validates**: Requirement 10.1
+**1. IMPPAT Scraping Failure**
+- **Trigger**: IMPPAT website unavailable or structure changed
+- **Action**: Silently fallback to local cached ADMET data
+- **User Impact**: None (seamless fallback)
+- **Logging**: Log error for monitoring
+- **Validates**: Requirements 2.5, 12.1
 
-**2. Low Confidence Identification**
-- **Trigger**: Multiple medicines match with similar confidence scores
-- **Response**: "I found multiple medicines matching '[input]'. Did you mean: 1) [Option A], 2) [Option B], 3) [Option C]?"
-- **Action**: Wait for user selection
-- **Validates**: Requirements 1.5, 10.5
+**2. DrugBank/Drugs.com Scraping Failure**
+- **Trigger**: DrugBank website unavailable or blocked
+- **Action**: Silently fallback to local cached drug data
+- **User Impact**: None (seamless fallback)
+- **Logging**: Log error for monitoring
+- **Validates**: Requirements 3.5, 12.1
 
-**3. Insufficient Evidence**
-- **Trigger**: All checking layers return no interaction data
-- **Response**: "I don't have enough information about interactions between [Med A] and [Med B]. This doesn't mean they're safe together—please consult your pharmacist or doctor."
-- **Severity**: Caution (not Safe)
-- **Validates**: Requirements 10.2, 13.5
+**3. Medicine Not Found**
+- **Trigger**: Medicine not in local DB and web search returns no results
+- **Response**: "I couldn't find '{medicine}' in my database. Could you check the spelling or try a different name?"
+- **Action**: Request clarification from user
+- **Validates**: Requirements 1.5, 12.2
 
-**4. External Service Failure**
-- **Trigger**: RAG search, Tavily API, or LLM API fails
-- **Response**: "I'm having trouble accessing some data sources. I can still check against my core database. Results may be incomplete."
-- **Action**: Continue with cached/local data only
-- **Validates**: Requirement 10.4
+**4. Partial Data Available**
+- **Trigger**: Some data sources succeeded, others failed
+- **Action**: Proceed with available data, note limitations in professional view
+- **User Impact (Patient)**: No visible difference
+- **User Impact (Professional)**: Show "Data from cached sources" indicator
+- **Validates**: Requirements 4.3, 12.4
 
-**5. Invalid Input**
-- **Trigger**: User sends non-medicine-related query
-- **Response**: "I specialize in checking medicine interactions. Could you tell me which medicines you'd like me to check?"
-- **Action**: Prompt for medicine names
-- **Validates**: Requirement 13.4
+**5. All Data Sources Failed**
+- **Trigger**: Complete network failure or all sources unavailable
+- **Response**: "I'm having trouble accessing data sources. Please try again in a few minutes, or consult your pharmacist directly."
+- **Validates**: Requirements 12.3
 
-**6. Session Timeout**
-- **Trigger**: User inactive for >30 minutes
-- **Response**: "Your session has expired. Please start a new interaction check."
-- **Action**: Clear context, start fresh
-- **Validates**: Requirement 14.4
+**6. LLM Generation Failure**
+- **Trigger**: Claude API timeout or error
+- **Action**: Use template-based response with available data
+- **Template**: "Based on available data, {medicine1} and {medicine2} may interact via {mechanism}. Please consult your healthcare provider for personalized advice."
+- **Validates**: Requirements 12.5
 
-**7. Rate Limiting**
-- **Trigger**: Too many requests from same user
-- **Response**: "You've made many requests recently. Please wait a moment before checking again."
-- **Action**: Implement exponential backoff
+**7. Timeout During Data Gathering**
+- **Trigger**: Parallel data gathering exceeds 30 seconds
+- **Action**: Use partial results with appropriate caveats
+- **Response**: Include "Analysis based on partial data" disclaimer
+- **Validates**: Requirements 4.5
 
 ### Error Handling Principles
 
-1. **Never claim safety by default**: Absence of evidence ≠ evidence of absence
-2. **Always provide actionable next steps**: Don't just say "error occurred"
-3. **Maintain user trust**: Be transparent about limitations
-4. **Graceful degradation**: Partial functionality > complete failure
-5. **Log for improvement**: Track errors to improve database coverage
-
+1. **Silent Fallback**: User should not see error messages for recoverable errors
+2. **Graceful Degradation**: Partial functionality > complete failure
+3. **Transparency (Professional Mode)**: Indicate when cached data is used
+4. **Never Assume Safety**: Absence of data ≠ absence of interaction
+5. **Logging for Improvement**: Track all errors to improve system reliability
 
 ## Testing Strategy
 
 ### Unit Testing
 
-Unit tests will verify specific examples and integration points between components. Key areas:
+**AYUSH Data Agent:**
+- Test local DB lookup with various common names
+- Test IMPPAT scraping with mock HTML responses
+- Test fallback activation when scraping fails
+- Test CYP inducer web search parsing
 
-**Medicine Identifier Agent:**
-- Test normalization of known brand names (e.g., "Glycomet" → "Metformin")
-- Test spell correction for common misspellings (e.g., "metformine" → "Metformin")
-- Test Hindi name recognition (e.g., "हल्दी" → "Turmeric")
-- Test ingredient extraction from formulations
+**Allopathy Data Agent:**
+- Test brand to generic name resolution
+- Test DrugBank scraping with mock HTML
+- Test Drugs.com scraping with mock HTML
+- Test fallback activation when scraping fails
 
-**Interaction Checker Agent:**
-- Test curated database lookups for known pairs
-- Test pharmacodynamic effect matching logic
-- Test CYP450 inference rules
-- Test severity calculation for different scenarios
+**Reasoning Agent:**
+- Test CYP interaction detection (inhibitor + substrate)
+- Test pharmacodynamic overlap detection
+- Test conflict detection with contradicting sources
+- Test severity calculation for various scenarios
+- Test grounded response generation (no unsourced claims)
 
-**Explanation Agent:**
-- Test disclaimer inclusion in all outputs
-- Test emoji formatting for WhatsApp
-- Test Hindi translation for key phrases
-- Test report generation format
-
-**Orchestrator Agent:**
-- Test intent parsing for different query types
-- Test agent routing logic
-- Test context persistence across turns
-- Test error handling and fallbacks
-
-### Property-Based Testing
-
-Property-based tests will verify universal properties across all inputs using **Hypothesis** (Python PBT library). Each test will run a minimum of 100 iterations with randomly generated inputs.
-
-**Configuration:**
-```python
-from hypothesis import given, settings, strategies as st
-
-@settings(max_examples=100)
-```
-
-**Test Generators:**
-```python
-# Medicine name generator
-medicine_names = st.sampled_from([
-    "Metformin", "Ashwagandha", "Turmeric", "Warfarin", ...
-])
-
-# Severity level generator
-severity_levels = st.sampled_from(["Safe", "Caution", "Warning", "Danger"])
-
-# Interaction generator
-@st.composite
-def interaction_strategy(draw):
-    return Interaction(
-        medicine_1=draw(medicine_names),
-        medicine_2=draw(medicine_names),
-        severity=draw(severity_levels),
-        ...
-    )
-```
-
-**Property Test Tagging:**
-Each property-based test must include a comment explicitly referencing the design document property:
-
-```python
-@given(medicine_names, medicine_names)
-@settings(max_examples=100)
-def test_pairwise_checking_completeness(med1, med2):
-    """
-    Feature: ayush-allopathy-checker, Property 4: Pairwise interaction checking completeness
-    
-    For any list of N medicines where N ≥ 2, the system should check 
-    exactly N*(N-1)/2 unique pairs for interactions.
-    """
-    # Test implementation
-```
-
-**Key Property Tests:**
-
-1. **Property 1 Test**: Generate medicine aliases, verify all normalize to same standard name
-2. **Property 4 Test**: Generate lists of N medicines, verify N*(N-1)/2 pairs checked
-3. **Property 5 Test**: Generate medicine pairs not in curated DB, verify layer cascade
-4. **Property 6 Test**: Generate interaction lists, verify severity ordering
-5. **Property 7 Test**: Generate interactions, verify schema completeness
-6. **Property 11 Test**: Generate interactions, request Hindi, verify Hindi characters present
-7. **Property 13 Test**: Generate Hindi medicine names, verify resolution to standard names
-8. **Property 19 Test**: Monitor agent calls, verify no agent performs another's responsibilities
-9. **Property 24 Test**: Generate medicine pairs, measure query time < 100ms
-10. **Property 27 Test**: Generate any interaction result, verify disclaimer present
-11. **Property 30 Test**: Generate interactions for WhatsApp, verify correct emoji
-12. **Property 35 Test**: Generate medicine pairs with shared effect categories, verify additive flag
-13. **Property 39 Test**: Generate reports, verify all required fields present
+**Communicator Agent:**
+- Test language detection (English, Hindi, Hinglish)
+- Test response length constraint (4-5 sentences)
+- Test language matching in response
 
 ### Integration Testing
 
-Integration tests will verify end-to-end flows:
+1. **End-to-End Professional Flow**: Submit query → verify detailed response with sources
+2. **End-to-End Patient Flow**: Submit query → verify simple multilingual response
+3. **Fallback Flow**: Disable IMPPAT → verify cached data used seamlessly
+4. **Parallel Execution**: Verify both agents run in parallel (timing check)
+5. **Conflict Handling**: Submit query with known conflicting sources → verify conflict reported
 
-1. **WhatsApp to Response Flow**: Send message via Twilio → verify formatted response
-2. **Multi-turn Conversation**: Send sequence of messages → verify context maintained
-3. **Database Hot-reload**: Update interaction JSON → verify new data used within 5s
-4. **Fallback Cascade**: Query unknown pair → verify all 5 layers attempted
-5. **Report Generation**: Request report → verify shareable format produced
+### Demo Reliability Testing
 
-### Test Data Requirements
-
-**Minimum for Hackathon:**
-- 100 curated interactions in JSON
-- 50 AYUSH medicines in SQLite
-- 100 allopathic drugs in SQLite
-- 50 brand name mappings
-- 20 Hindi medicine name mappings
-- 10 effect category definitions
-- 20 CYP450 rules
-- 200 research paper abstracts for RAG
-
+1. **Pre-identified Working Pairs**: Test all demo scenarios before presentation
+2. **Cache Verification**: Ensure local cache has data for all demo medicines
+3. **Timeout Testing**: Verify system handles slow networks gracefully
+4. **Language Testing**: Test Hindi and Hinglish responses for demo
 
 ## Performance Considerations
 
 ### Response Time Targets
 
-- **Medicine identification**: < 200ms
-- **Curated database lookup**: < 100ms
-- **Pharmacodynamic checking**: < 300ms
-- **CYP450 inference**: < 200ms
-- **RAG search**: < 2s
-- **Explanation generation**: < 1s
-- **Total end-to-end**: < 5s for simple queries, < 10s for complex multi-medicine checks
-
-### Scalability Considerations
-
-**Hackathon Scope:**
-- Support 10-50 concurrent users
-- Handle 1000 queries per day
-- SQLite sufficient for data storage
-- In-memory caching for curated interactions
-
-**Production Considerations (Future):**
-- Migrate to PostgreSQL with connection pooling
-- Implement Redis for session management
-- Use CDN for static assets
-- Horizontal scaling with Kubernetes
-- Rate limiting per user (10 requests/minute)
+- **Local DB lookup**: < 50ms
+- **IMPPAT scraping**: < 3s (with 5s timeout)
+- **DrugBank scraping**: < 3s (with 5s timeout)
+- **Web search**: < 2s
+- **Reasoning generation**: < 2s
+- **Total end-to-end (with scraping)**: < 15s
+- **Total end-to-end (with cache)**: < 5s
 
 ### Caching Strategy
 
-1. **Curated Interactions**: Load into memory at startup, refresh every 5 minutes
-2. **Medicine Metadata**: Cache in Redis with 1-hour TTL
-3. **RAG Embeddings**: Pre-compute and store in ChromaDB
-4. **LLM Responses**: Cache common explanations for 24 hours
-5. **Session Context**: Store in Redis with 30-minute TTL
+1. **Local Medicine DB**: Loaded at startup, held in memory
+2. **Successful Scrape Results**: Cached for 24 hours
+3. **Curated Interactions**: Loaded at startup, immediate lookup
+4. **Session Context**: In-memory with 30-minute TTL
 
 ## Security and Privacy
 
 ### Data Privacy
 
-1. **No PII Storage**: Don't store user phone numbers or personal health information
-2. **Session Anonymization**: Use random session IDs, not phone numbers
-3. **Conversation Logging**: Log only for debugging, auto-delete after 7 days
-4. **HIPAA Considerations**: Add disclaimer that system is not HIPAA-compliant
+1. **No PII Storage**: Don't store user health information
+2. **Session Anonymization**: Use random session IDs
+3. **Conversation Logging**: Minimal logging, auto-delete after 7 days
 
 ### API Security
 
-1. **Twilio Webhook Validation**: Verify requests are from Twilio
-2. **Rate Limiting**: Prevent abuse with per-user limits
-3. **Input Sanitization**: Prevent injection attacks
-4. **API Key Management**: Use environment variables, never commit keys
-
-### Disclaimer and Liability
-
-Every response must include:
-> ⚠️ **Disclaimer**: This information is for educational purposes only and does not constitute medical advice. Always consult your doctor or pharmacist before starting, stopping, or changing any medication.
-
+1. **Rate Limiting**: Prevent abuse with per-IP limits
+2. **Input Sanitization**: Prevent injection in web scraping queries
+3. **API Key Management**: Environment variables, never in code
 
 ## Deployment Architecture
 
 ```mermaid
 graph TB
-    subgraph CLOUD["AWS / Cloud Platform"]
-        subgraph API["FastAPI Server"]
-            ORCH[Orchestrator Agent]
-            AGENTS[Specialist Agents]
-            WS[WebSocket Handler]
-        end
-        
-        subgraph UI["Streamlit Web UI"]
-            STREAM[Chat Interface]
-        end
-        
-        subgraph STORAGE["Data Layer"]
-            SQLITE[SQLite Databases]
-            CHROMA[ChromaDB]
-            JSON[JSON Files]
-        end
+    subgraph SERVER["FastAPI Server"]
+        FLOWS["CrewAI Flows"]
+        AGENTS["Specialist Agents"]
+        CACHE["In-Memory Cache"]
+    end
+    
+    subgraph UI["Streamlit Apps"]
+        WEB_UI["Web UI (Professional)"]
+        CHAT_UI["Chat UI (Patient)"]
+    end
+    
+    subgraph DATA["Local Data"]
+        JSON["JSON Files<br/>(AYUSH, Allopathy, Interactions)"]
+        SQLITE["SQLite<br/>(Optional)"]
     end
     
     subgraph EXT["External Services"]
-        TWILIO[Twilio WhatsApp]
-        BEDROCK[AWS Bedrock Claude]
-        TAVILY[Tavily Web Search]
+        IMPPAT["IMPPAT Website"]
+        DRUGBANK["DrugBank/Drugs.com"]
+        TAVILY["Tavily Web Search"]
+        CLAUDE["Claude API"]
     end
     
-    TWILIO --> API
-    STREAM --> API
-    API --> STORAGE
-    API --> BEDROCK
-    API --> TAVILY
+    WEB_UI --> FLOWS
+    CHAT_UI --> FLOWS
+    FLOWS --> AGENTS
+    AGENTS --> CACHE
+    AGENTS --> JSON
+    AGENTS --> IMPPAT
+    AGENTS --> DRUGBANK
+    AGENTS --> TAVILY
+    AGENTS --> CLAUDE
 ```
 
-**Deployment Components:**
+## Future Enhancements (Post-Hackathon)
 
-1. **FastAPI Server**: Hosts Orchestrator and specialist agents, handles WebSocket connections
-2. **Streamlit Web UI**: Separate container for web chat interface
-3. **Data Layer**: SQLite files, ChromaDB, and JSON files on persistent volumes
-4. **External Services**: Twilio for WhatsApp, AWS Bedrock for LLM, Tavily for web search
-
-## Future Enhancements
-
-### Phase 1 (Post-Hackathon)
+### Phase 1 (Month 1-2)
+- Commercial API access: DrugBank API, IMPPAT collaboration
+- Expanded local database: 100+ AYUSH medicines, 200+ drugs
 - Prescription OCR for medicine extraction from photos
-- Voice input support for accessibility
-- Expanded interaction database (1000+ pairs)
-- Real-time PubMed integration for latest research
+- Real WhatsApp integration via Twilio
 
 ### Phase 2 (Month 3-6)
-- Personalized risk assessment based on age and conditions
-- Doctor dashboard for patient medication review
-- Integration with Indian pharmacy APIs (1mg, PharmEasy)
-- PDF report generation with branding
+- Knowledge graph implementation with Neo4j
+- Personalized risk assessment based on age/conditions
+- PDF report generation
+- Additional regional language support (Tamil, Telugu, Bengali)
 
 ### Phase 3 (Month 6-12)
-- 10 regional languages (Tamil, Telugu, Bengali, Marathi, Gujarati, etc.)
-- ABDM/Health Stack integration for EHR access
-- Pharmacovigilance reporting to AYUSH Suraksha
-- Offline mode for low-connectivity areas
-- Community contribution platform for verified practitioners
-
+- Integration with Indian health platforms (1mg, PharmEasy)
+- ABDM Health Stack integration
+- Pharmacovigilance reporting
+- Practitioner dashboard for patient management
 
 ## Appendix: Sample Conversation Flows
 
-### Example 1: Simple Two-Medicine Check
+### Example 1: Professional User - Web Interface
 
+**Input:** Ashwagandha + Metformin
+
+**Output (Web UI):**
 ```
-USER: I take metformin for diabetes and ashwagandha for stress. Is this safe?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    INTERACTION ANALYSIS REPORT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-SYSTEM:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🟠 WARNING: Interaction Found
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MEDICINES ANALYZED
+─────────────────────────────────────────────────────────────────────
+AYUSH Medicine: Ashwagandha (Withania somnifera)
+System: Ayurveda
+Data Source: Real-time IMPPAT scrape
 
-Metformin + Ashwagandha
+Allopathic Drug: Metformin
+Class: Biguanide
+Data Source: Real-time DrugBank scrape
 
-Both medicines can lower blood sugar. When taken 
-together, your sugar levels might drop more than 
-expected.
+SEVERITY: ⚠️ MODERATE
 
-🔍 What to watch for:
-• Shakiness or trembling
+INTERACTION MECHANISMS
+─────────────────────────────────────────────────────────────────────
+1. Pharmacodynamic Interaction: ADDITIVE HYPOGLYCEMIC EFFECT
+   - Ashwagandha: Blood sugar lowering effect (traditional use, clinical studies)
+   - Metformin: Blood sugar lowering (primary mechanism)
+   - Combined effect: Risk of hypoglycemia
+   Source: Pharmacodynamic category overlap
+
+2. CYP Pathway Analysis: NO SIGNIFICANT CYP INTERACTION
+   - Metformin is not significantly metabolized by CYP450 enzymes
+   - Ashwagandha's CYP effects unlikely to affect Metformin levels
+   Source: DrugBank metabolism data
+
+EVIDENCE SOURCES
+─────────────────────────────────────────────────────────────────────
+[1] IMPPAT - Ashwagandha phytochemicals
+    https://cb.imsc.res.in/imppat/phytochemical/withania-somnifera
+    
+[2] DrugBank - Metformin metabolism
+    https://go.drugbank.com/drugs/DB00331
+    
+[3] PubMed - Ashwagandha hypoglycemic effect
+    https://pubmed.ncbi.nlm.nih.gov/25796090/
+
+CLINICAL EFFECTS TO MONITOR
+─────────────────────────────────────────────────────────────────────
+• Hypoglycemia (low blood sugar)
+• Shakiness, trembling
 • Excessive sweating
 • Sudden hunger
-• Dizziness or confusion
+• Dizziness, confusion
 
-✅ Recommendations:
-• Monitor your blood sugar more frequently
-• Keep glucose tablets or sugar handy
-• Inform your doctor about the Ashwagandha
-• Don't stop either medicine without consulting
+RECOMMENDATIONS
+─────────────────────────────────────────────────────────────────────
+• Monitor blood glucose more frequently when combining
+• Keep glucose tablets or sugar source available
+• Inform prescribing physician about Ashwagandha use
+• Do not stop either medicine without medical consultation
 
-📚 Evidence: Clinical studies (Medium confidence)
+⚠️ DISCLAIMER: This information is for educational purposes only. 
+Always consult your healthcare provider before making medication changes.
 
-⚠️ Disclaimer: This information is for educational 
-purposes only. Always consult your doctor or 
-pharmacist before making medication changes.
-
-Would you like me to check any other medicines?
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
-### Example 2: Multi-Medicine Check with Progress Indicators
+### Example 2: Patient User - Chat Interface (English)
 
+**User:** Can I take ashwagandha with my diabetes medicine metformin?
+
+**Response:**
 ```
-USER: I take metformin, amlodipine, ashwagandha, triphala, and ecosprin daily. Check all interactions.
+Taking Ashwagandha with Metformin needs some caution. Both can lower 
+your blood sugar, so together they might make it drop more than usual. 
 
-SYSTEM: 🔄 Checking interactions for 5 medicines (10 combinations)...
+Watch for signs like shakiness, sweating, or feeling suddenly hungry - 
+these could mean your sugar is too low. It's a good idea to check your 
+blood sugar more often and keep some glucose tablets handy.
 
-SYSTEM: ✅ Identified all 5 medicines. Checking interactions...
-
-SYSTEM:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📊 Interaction Check Complete
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Checked 5 medicines (10 combinations)
-Found 2 interactions
-
-🟠 WARNING LEVEL (1)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Metformin + Ashwagandha
-Both lower blood sugar - risk of hypoglycemia
-→ Monitor glucose closely, keep sugar handy
-
-🟡 CAUTION LEVEL (1)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Ecosprin + Ashwagandha
-Both have blood-thinning effects
-→ Watch for unusual bruising or bleeding
-
-🟢 SAFE COMBINATIONS (8)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-• Metformin + Amlodipine ✓
-• Metformin + Triphala ✓
-• Metformin + Ecosprin ✓
-• Amlodipine + Ashwagandha ✓
-• Amlodipine + Triphala ✓
-• Amlodipine + Ecosprin ✓
-• Ashwagandha + Triphala ✓
-• Triphala + Ecosprin ✓
-
-⚠️ Disclaimer: This information is for educational 
-purposes only. Always consult your doctor or 
-pharmacist before making medication changes.
-
-Would you like a detailed report to share with 
-your doctor?
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Please talk to your doctor about using Ashwagandha with your diabetes 
+medicine - they can help you stay safe.
 ```
 
-### Example 3: Hindi Language Request
+### Example 3: Patient User - Chat Interface (Hindi)
 
+**User:** क्या मैं मेटफॉर्मिन के साथ अश्वगंधा ले सकता हूं?
+
+**Response:**
 ```
-USER: मुझे मेटफॉर्मिन और अश्वगंधा के बारे में हिंदी में बताएं
+अश्वगंधा और मेटफॉर्मिन साथ में लेने में थोड़ी सावधानी जरूरी है। दोनों 
+ब्लड शुगर कम करते हैं, तो साथ में लेने पर शुगर ज्यादा गिर सकती है।
 
-SYSTEM:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🟠 चेतावनी: इंटरैक्शन मिला
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+अगर कंपकंपी, पसीना, या अचानक भूख लगे तो समझिए शुगर कम हो रही है। 
+शुगर जांचते रहिए और ग्लूकोज टैबलेट पास रखिए।
 
-मेटफॉर्मिन (Metformin) + अश्वगंधा (Ashwagandha)
-
-दोनों दवाएं ब्लड शुगर कम कर सकती हैं। साथ में लेने 
-पर आपका शुगर लेवल उम्मीद से ज्यादा गिर सकता है।
-
-🔍 इन लक्षणों पर ध्यान दें:
-• कंपकंपी या कांपना
-• अत्यधिक पसीना आना
-• अचानक भूख लगना
-• चक्कर आना या भ्रम
-
-✅ सिफारिशें:
-• अपने ब्लड शुगर की अधिक बार जांच करें
-• ग्लूकोज टैबलेट या चीनी पास रखें
-• अपने डॉक्टर को अश्वगंधा के बारे में बताएं
-
-📚 साक्ष्य: क्लिनिकल अध्ययन (मध्यम विश्वसनीयता)
-
-⚠️ अस्वीकरण: यह जानकारी केवल शैक्षिक उद्देश्यों के 
-लिए है। दवा में कोई भी बदलाव करने से पहले हमेशा 
-अपने डॉक्टर या फार्मासिस्ट से परामर्श करें।
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+अपने डॉक्टर से अश्वगंधा के बारे में जरूर बात करें।
 ```
 
-### Example 4: Clarification Request
+### Example 4: Patient User - Chat Interface (Hinglish)
 
+**User:** metformin ke sath ashwagandha le sakte hai kya?
+
+**Response:**
 ```
-USER: I'm taking metform
+Ashwagandha aur Metformin saath mein lene mein thodi care chahiye. 
+Dono blood sugar kam karte hain, toh together lene se sugar zyada 
+gir sakti hai.
 
-SYSTEM: I found multiple medicines matching 'metform'. Did you mean:
-1) Metformin (for diabetes)
-2) Metformin Extended Release
-3) Metformin + Glipizide combination
+Agar kaanpne lage, bahut paseena aaye, ya achanak bhook lage toh 
+samjho sugar low ho rahi hai. Sugar check karte raho aur glucose 
+tablets paas rakho.
 
-Please reply with the number or full name.
-
-USER: 1
-
-SYSTEM: Got it! You're taking Metformin. What other medicines would you like me to check it against?
+Apne doctor ko Ashwagandha ke baare mein zaroor batao - wo aapko 
+sahi advice de sakte hain.
 ```
 
-### Example 5: No Interaction Found
+### Example 5: Unknown Interaction
 
+**User:** Can I take Brahmi with Lisinopril?
+
+**Response (Patient):**
 ```
-USER: Can I take vitamin D with turmeric?
+I couldn't find specific research on Brahmi and Lisinopril together. 
+This doesn't mean it's definitely safe or unsafe - it just means 
+there isn't enough data available.
 
-SYSTEM:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🟢 No Known Interactions
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+To be safe, please check with your doctor or pharmacist before 
+combining these medicines. They can review your complete health 
+picture and give you personalized advice.
+```
 
-Vitamin D + Turmeric (Haldi)
+**Response (Professional - shows sources attempted):**
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    INTERACTION ANALYSIS REPORT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-I didn't find any documented interactions between 
-these two. However, this doesn't guarantee they're 
-completely safe together.
+SEVERITY: ❓ UNKNOWN - INSUFFICIENT DATA
 
-✅ General Recommendations:
-• Take as directed by your healthcare provider
-• Monitor for any unusual symptoms
-• Inform your doctor about all supplements
+DATA GATHERING RESULTS
+─────────────────────────────────────────────────────────────────────
+AYUSH Medicine: Brahmi (Bacopa monnieri)
+- IMPPAT ADMET data: Retrieved ✓
+- CYP inhibitor data: Limited data available
+- CYP inducer search: No significant findings
 
-⚠️ Note: Lack of documented interactions doesn't 
-mean interactions are impossible. New research 
-emerges regularly.
+Allopathic Drug: Lisinopril
+- DrugBank data: Retrieved ✓
+- CYP metabolism: Not significantly CYP-metabolized
 
-⚠️ Disclaimer: This information is for educational 
-purposes only. Always consult your doctor or 
-pharmacist before making medication changes.
+ANALYSIS
+─────────────────────────────────────────────────────────────────────
+1. CYP Pathway: No interaction expected (Lisinopril not CYP-metabolized)
+2. Pharmacodynamic: Both may affect blood pressure - potential additive effect
+3. Research: No specific studies found for this combination
 
-Would you like me to check any other medicines?
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SOURCES CHECKED
+─────────────────────────────────────────────────────────────────────
+[1] IMPPAT - Brahmi: https://cb.imsc.res.in/imppat/...
+[2] DrugBank - Lisinopril: https://go.drugbank.com/drugs/DB00722
+[3] PubMed search - "Brahmi Lisinopril interaction": No relevant results
+
+RECOMMENDATION
+─────────────────────────────────────────────────────────────────────
+Insufficient evidence to determine interaction. Patient should consult 
+healthcare provider for personalized assessment.
+
+⚠️ Note: Absence of documented interaction does not guarantee safety.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```

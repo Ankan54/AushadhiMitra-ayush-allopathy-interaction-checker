@@ -2,215 +2,241 @@
 
 ## Introduction
 
-AushadhiMitra is an AI-powered interaction checker that helps users identify potential drug interactions between AYUSH (Ayurveda, Yoga & Naturopathy, Unani, Siddha, and Homeopathy) medicines and allopathic drugs. The system uses a multi-agent architecture to parse natural language queries, identify medicines across both systems, check for interactions using multiple data sources, and provide patient-friendly explanations in English and Hindi.
+AushadhiMitra is an AI-powered interaction checker that helps users identify potential drug interactions between AYUSH (Ayurveda, Yoga & Naturopathy, Unani, Siddha, and Homeopathy) medicines and allopathic drugs. The system uses a multi-agent architecture built with CrewAI Flows to gather real-time data from multiple sources (IMPPAT, DrugBank, web search), perform grounded reasoning on the gathered evidence, and provide accurate interaction assessments with full source citations.
+
+The system supports two user personas: AYUSH practitioners who need detailed technical information with evidence sources, and individual patients who need simple, multilingual explanations. The architecture emphasizes real-time data gathering to ensure accuracy and relevancy, with local fallback data for demo reliability.
 
 ## Glossary
 
 - **AYUSH**: Ayurveda, Yoga & Naturopathy, Unani, Siddha, and Homeopathy traditional medicine systems
 - **Allopathic Drug**: Modern pharmaceutical medicine based on Western medical science
-- **Orchestrator Agent**: The primary agent that manages conversation flow and routes requests to specialist agents
-- **Medicine Identifier Agent**: Specialist agent responsible for normalizing medicine names and identifying medicine types
-- **Interaction Checker Agent**: Specialist agent that evaluates potential interactions using multiple data layers
-- **Explanation Agent**: Specialist agent that generates patient-friendly explanations and translations
+- **IMPPAT**: Indian Medicinal Plants, Phytochemistry And Therapeutics database - primary source for AYUSH phytochemical data
+- **DrugBank**: Comprehensive pharmaceutical database for allopathic drug ADMET properties
+- **ADMET**: Absorption, Distribution, Metabolism, Excretion, Toxicity properties of a drug
 - **CYP450 Pathway**: Cytochrome P450 enzyme system responsible for drug metabolism
+- **CYP Inhibitor**: A compound that blocks CYP enzyme activity, potentially increasing drug levels
+- **CYP Inducer**: A compound that increases CYP enzyme activity, potentially decreasing drug efficacy
+- **CYP Substrate**: A drug that is metabolized by a specific CYP enzyme
+- **Phytochemical**: Chemical compound produced by plants, the active ingredients in AYUSH medicines
 - **Pharmacodynamic Interaction**: Interaction based on the combined effects of medicines on the body
-- **RAG**: Retrieval-Augmented Generation for searching research literature
-- **Interaction Severity**: Classification of interaction risk as Safe, Caution, Warning, or Danger
-- **Effect Category**: Classification of a medicine's pharmacodynamic effects (e.g., Blood Sugar Lowering, Blood Thinning) used for inferring potential interactions
-- **Additive Interaction**: When two medicines with similar effects combine to produce an enhanced effect
-- **Antagonistic Interaction**: When two medicines have opposing effects that may reduce efficacy
+- **Pharmacokinetic Interaction**: Interaction based on how medicines affect each other's absorption, metabolism, or elimination
+- **Grounded Response**: AI response that is strictly based on provided evidence sources, not model's internal knowledge
+- **Evidence Hierarchy**: Ranking of evidence quality: Clinical Study > In Vivo > In Vitro > Computational Prediction
+- **Conflict Detection**: Identifying when different sources provide contradictory information about an interaction
+- **CrewAI Flows**: Framework for orchestrating multi-agent workflows with parallel and sequential execution
+- **Severity Level**: Classification of interaction risk as NONE, LOW, MODERATE, or HIGH
+- **Effect Category**: Classification of a medicine's pharmacodynamic effects (e.g., Blood Sugar Lowering, Blood Thinning)
 
 ## Requirements
 
-### Requirement 1
+### Requirement 1: Natural Language Medicine Input
 
-**User Story:** As a patient taking both AYUSH and allopathic medicines, I want to input my medicines in natural language, so that I can easily check for interactions without medical terminology.
-
-#### Acceptance Criteria
-
-1. WHEN a user sends a message containing medicine names THEN the Orchestrator Agent SHALL parse the message and extract medicine references
-2. WHEN a user describes medicines using common terms or brand names THEN the Medicine Identifier Agent SHALL normalize the names to standard forms
-3. WHEN a user misspells a medicine name THEN the Medicine Identifier Agent SHALL correct the spelling and identify the intended medicine
-4. WHEN a user mentions a brand name THEN the Medicine Identifier Agent SHALL map the brand name to its generic equivalent
-5. WHEN the system cannot identify a medicine with confidence THEN the Orchestrator Agent SHALL request clarification from the user
-
-### Requirement 2
-
-**User Story:** As a user, I want the system to recognize both AYUSH and allopathic medicines, so that I can check interactions across both medical systems.
+**User Story:** As a patient taking both AYUSH and allopathic medicines, I want to input my medicines in natural language using common names or brand names, so that I can easily check for interactions without medical terminology.
 
 #### Acceptance Criteria
 
-1. WHEN a medicine name is provided THEN the Medicine Identifier Agent SHALL classify it as either AYUSH or Allopathic
-2. WHEN an AYUSH medicine is identified THEN the Medicine Identifier Agent SHALL determine its system classification (Ayurveda, Siddha, Unani, or Homeopathy)
-3. WHEN an AYUSH formulation contains multiple ingredients THEN the Medicine Identifier Agent SHALL extract the active ingredient list
-4. WHEN an allopathic drug is identified THEN the Medicine Identifier Agent SHALL retrieve its drug class and mechanism of action
-5. WHEN a medicine has multiple aliases THEN the Medicine Identifier Agent SHALL recognize all common variations
+1. WHEN a user sends a message containing medicine names THEN the AYUSH Data Agent or Allopathy Data Agent SHALL extract and identify the medicine references
+2. WHEN a user describes medicines using common names (e.g., "haldi" for Turmeric) THEN the agent SHALL normalize the names to standard scientific forms using the local curated database
+3. WHEN a user mentions an allopathic brand name (e.g., "Glycomet") THEN the Allopathy Data Agent SHALL perform web search to find its generic name and chemical composition
+4. WHEN a user mentions an AYUSH brand name (e.g., "Himalaya Ashwagandha") THEN the AYUSH Data Agent SHALL identify the primary herb or formulation
+5. WHEN the system cannot identify a medicine with confidence THEN the Orchestrator SHALL request clarification from the user before proceeding
 
-### Requirement 3
+### Requirement 2: AYUSH Medicine Data Gathering
 
-**User Story:** As a user checking medicine safety, I want to know if my medicines interact, so that I can make informed decisions about my health.
+**User Story:** As a system processing AYUSH medicines, I want to gather comprehensive phytochemical and ADMET data, so that I can accurately assess potential interactions.
 
 #### Acceptance Criteria
 
-1. WHEN two or more medicines are identified THEN the Interaction Checker Agent SHALL evaluate all pairwise combinations for interactions
-2. WHEN checking for interactions THEN the Interaction Checker Agent SHALL query the curated interaction database first
-3. WHEN no direct interaction is found in the database THEN the Interaction Checker Agent SHALL check for pharmacodynamic effect overlaps
-4. WHEN pharmacodynamic checking is inconclusive THEN the Interaction Checker Agent SHALL evaluate CYP450 pathway interactions
-5. WHEN database and inference methods find no interaction THEN the Interaction Checker Agent SHALL search research literature using RAG
+1. WHEN an AYUSH medicine is identified THEN the AYUSH Data Agent SHALL first lookup the local curated database for common name to scientific name mapping
+2. WHEN the scientific name is found THEN the agent SHALL retrieve phytochemical links from the local pre-extracted IMPPAT data
+3. WHEN phytochemical links are available THEN the agent SHALL scrape IMPPAT website to extract ADMET properties including CYP inhibitor/inducer data (displayed from SwissADME)
+4. WHEN CYP inducer information is not available from IMPPAT THEN the agent SHALL perform web search to find CYP inducer research data
+5. WHEN web scraping fails THEN the agent SHALL automatically fallback to locally cached ADMET data for that medicine
+6. WHEN an AYUSH medicine is not in the local database THEN the agent SHALL perform web search to gather basic information and inform the user about limited data availability
 
-### Requirement 4
+### Requirement 3: Allopathic Drug Data Gathering
+
+**User Story:** As a system processing allopathic drugs, I want to gather comprehensive ADMET and CYP metabolism data, so that I can accurately assess potential interactions.
+
+#### Acceptance Criteria
+
+1. WHEN an allopathic drug name is provided (likely a brand name) THEN the Allopathy Data Agent SHALL perform web search to find its chemical composition and generic names
+2. WHEN generic names are identified THEN the agent SHALL search DrugBank.com or Drugs.com to extract CYP substrate, inhibitor, and inducer data
+3. WHEN CYP inducer information is needed THEN the agent SHALL also search for inducer data via web search
+4. WHEN the drug is another AYUSH medicine THEN the system SHALL route it to the AYUSH Data Agent instead
+5. WHEN web scraping fails THEN the agent SHALL automatically fallback to locally cached drug data
+6. WHEN a drug is not found in any source THEN the agent SHALL inform the Reasoning Agent about data limitations
+
+### Requirement 4: Parallel Data Processing
+
+**User Story:** As a system architect, I want both medicine data gathering processes to run in parallel, so that the system provides faster responses to users.
+
+#### Acceptance Criteria
+
+1. WHEN two medicines are identified THEN the AYUSH Data Agent and Allopathy Data Agent SHALL execute in parallel using CrewAI Flows
+2. WHEN both agents complete THEN their results SHALL be passed to the Reasoning Agent for analysis
+3. WHEN one agent fails THEN the other agent SHALL continue processing and partial results SHALL be used
+4. WHEN processing multiple medicine pairs THEN the system SHALL optimize parallel execution for all pairs
+5. WHEN parallel execution exceeds timeout (30 seconds) THEN the system SHALL use available partial results with appropriate caveats
+
+### Requirement 5: Grounded Reasoning and Conflict Detection
+
+**User Story:** As a healthcare information system, I want to generate interaction assessments that are strictly grounded in gathered evidence and transparently handle conflicting sources, so that users receive accurate and trustworthy information.
+
+#### Acceptance Criteria
+
+1. WHEN the Reasoning Agent receives data from both medicine agents THEN it SHALL analyze ONLY the provided evidence without using internal model knowledge for factual claims
+2. WHEN analyzing CYP interactions THEN the agent SHALL check if the AYUSH phytochemicals inhibit/induce CYP enzymes that metabolize the allopathic drug
+3. WHEN different sources provide conflicting information THEN the agent SHALL explicitly identify and report the conflict
+4. WHEN resolving conflicts THEN the agent SHALL prioritize sources based on evidence hierarchy: Clinical Study > In Vivo Study > In Vitro Study > Computational Prediction > Traditional Knowledge
+5. WHEN conflicts cannot be resolved THEN the agent SHALL present both viewpoints and recommend consulting a healthcare provider
+6. WHEN evidence is insufficient THEN the agent SHALL report "UNKNOWN - Limited data available" rather than inferring safety
+
+### Requirement 6: Severity Classification
 
 **User Story:** As a patient, I want to understand the severity of any interaction found, so that I know how urgently I need to act.
 
 #### Acceptance Criteria
 
-1. WHEN an interaction is detected THEN the Interaction Checker Agent SHALL classify the severity as Safe, Caution, Warning, or Danger
-2. WHEN calculating severity THEN the Interaction Checker Agent SHALL consider the interaction mechanism type
-3. WHEN calculating severity THEN the Interaction Checker Agent SHALL consider the clinical evidence level
-4. WHEN multiple interactions are found THEN the Orchestrator Agent SHALL present them ordered by severity from highest to lowest
-5. WHEN severity is Warning or Danger THEN the Explanation Agent SHALL include urgent action recommendations
+1. WHEN an interaction is detected THEN the Reasoning Agent SHALL classify severity as NONE, LOW, MODERATE, or HIGH using rule-based scoring
+2. WHEN calculating severity THEN the agent SHALL consider: CYP interaction type (inhibitor vs inducer), CYP interaction strength (strong/moderate/weak), pharmacodynamic overlap, number of clinical case reports, and evidence quality
+3. WHEN CYP inhibition is detected THEN the severity SHALL reflect risk of increased drug levels and potential toxicity
+4. WHEN CYP induction is detected THEN the severity SHALL reflect risk of decreased drug efficacy
+5. WHEN both CYP and pharmacodynamic interactions exist THEN the scores SHALL be combined for overall severity
+6. WHEN severity is HIGH THEN the response SHALL include urgent action recommendations and explicit advice to consult a healthcare provider
 
-### Requirement 5
+### Requirement 7: Source Citation and Traceability
 
-**User Story:** As a non-medical professional, I want explanations in simple language, so that I can understand what the interaction means without medical training.
-
-#### Acceptance Criteria
-
-1. WHEN an interaction is found THEN the Explanation Agent SHALL generate a patient-friendly explanation of the mechanism
-2. WHEN explaining an interaction THEN the Explanation Agent SHALL describe observable symptoms or effects the user should monitor
-3. WHEN providing recommendations THEN the Explanation Agent SHALL include specific actionable steps
-4. WHEN citing evidence THEN the Explanation Agent SHALL reference the source type and reliability level
-5. WHEN no interaction is found THEN the Explanation Agent SHALL provide reassurance with appropriate caveats
-
-### Requirement 6
-
-**User Story:** As a Hindi-speaking user, I want to receive information in Hindi, so that I can fully understand the health information.
+**User Story:** As an AYUSH practitioner, I want interaction results to cite all evidence sources with URLs, so that I can verify the information and assess its reliability.
 
 #### Acceptance Criteria
 
-1. WHEN a user requests Hindi language THEN the Explanation Agent SHALL translate all explanations to Hindi
-2. WHEN translating THEN the Explanation Agent SHALL preserve medical accuracy while using accessible vocabulary
-3. WHEN displaying medicine names in Hindi THEN the system SHALL show both the Hindi name and the standard medical name
-4. WHEN a user inputs medicine names in Hindi THEN the Medicine Identifier Agent SHALL recognize common Hindi medicine names
-5. WHEN severity levels are displayed THEN the Explanation Agent SHALL translate severity categories to Hindi equivalents
+1. WHEN any claim is made about an interaction THEN the system SHALL cite the specific source URL that supports the claim
+2. WHEN data is scraped from IMPPAT THEN the system SHALL include the IMPPAT phytochemical page URL
+3. WHEN data is from DrugBank or Drugs.com THEN the system SHALL include the specific drug page URL
+4. WHEN research articles support an interaction THEN the system SHALL include PubMed links or article URLs from web search
+5. WHEN an interaction is inferred from CYP pathway analysis THEN the system SHALL clearly label it as "Inferred from CYP mechanism" with the sources used for CYP data
+6. WHEN evidence quality varies THEN the system SHALL indicate the evidence level (Clinical/In Vivo/In Vitro/Predicted) for each source
 
-### Requirement 7
+### Requirement 8: Professional User Interface (Web)
 
-**User Story:** As a user managing multiple medicines, I want to check interactions for more than two medicines at once, so that I can evaluate my complete medication regimen.
-
-#### Acceptance Criteria
-
-1. WHEN a user provides three or more medicines THEN the Interaction Checker Agent SHALL evaluate all pairwise combinations
-2. WHEN multiple interactions are found THEN the Orchestrator Agent SHALL present a summary of all interactions
-3. WHEN presenting multiple interactions THEN the system SHALL group interactions by severity level
-4. WHEN no interactions are found among multiple medicines THEN the Explanation Agent SHALL confirm that all checked pairs are safe
-5. WHEN the interaction check is complex THEN the Orchestrator Agent SHALL provide progress indicators to the user
-
-### Requirement 8
-
-**User Story:** As a user, I want to have a conversational experience, so that I can ask follow-up questions and get clarifications naturally.
+**User Story:** As an AYUSH practitioner, I want a detailed web interface showing comprehensive drug comparison and evidence, so that I can make informed clinical decisions.
 
 #### Acceptance Criteria
 
-1. WHEN a user sends a message THEN the Orchestrator Agent SHALL maintain conversation context across multiple turns
-2. WHEN the system needs more information THEN the Orchestrator Agent SHALL ask clarifying questions in natural language
-3. WHEN a user asks a follow-up question THEN the Orchestrator Agent SHALL reference previous interaction results
-4. WHEN a user requests more details about an interaction THEN the Orchestrator Agent SHALL route to the appropriate specialist agent
-5. WHEN a conversation is complete THEN the Orchestrator Agent SHALL offer to check additional medicines
+1. WHEN a professional user submits medicines via the web interface THEN the system SHALL display a detailed comparison view
+2. WHEN displaying results THEN the interface SHALL show both drugs with their phytochemicals/compounds and ADMET properties
+3. WHEN displaying CYP data THEN the interface SHALL show enzyme-specific inhibitor and inducer information for both medicines
+4. WHEN displaying the assessment THEN the interface SHALL show the AI-generated technical summary directed toward medical professionals
+5. WHEN displaying sources THEN the interface SHALL show ALL clickable links to drugs, compounds, research articles, and data sources used
+6. WHEN conflicts exist in sources THEN the interface SHALL explicitly display the conflicting information with source attribution
 
-### Requirement 9
+### Requirement 9: Patient User Interface (Chat)
 
-**User Story:** As a system architect, I want clear separation between agent responsibilities, so that the system is maintainable and each agent can be improved independently.
-
-#### Acceptance Criteria
-
-1. WHEN the Orchestrator Agent receives a request THEN it SHALL route to exactly one specialist agent at a time
-2. WHEN a specialist agent completes its task THEN it SHALL return structured results to the Orchestrator Agent
-3. WHEN the Medicine Identifier Agent processes input THEN it SHALL not perform interaction checking
-4. WHEN the Interaction Checker Agent evaluates medicines THEN it SHALL not generate user-facing explanations
-5. WHEN the Explanation Agent generates output THEN it SHALL not perform medicine identification or interaction checking
-
-### Requirement 10
-
-**User Story:** As a developer, I want the system to handle edge cases gracefully, so that users receive helpful responses even when data is incomplete.
+**User Story:** As a non-medical patient, I want to interact via a simple chat interface in my preferred language, so that I can understand the interaction information easily.
 
 #### Acceptance Criteria
 
-1. WHEN a medicine is not found in any database THEN the Orchestrator Agent SHALL inform the user and suggest web search as a fallback
-2. WHEN research literature search returns no results THEN the Interaction Checker Agent SHALL report insufficient evidence rather than claiming safety
-3. WHEN the system encounters an error THEN the Orchestrator Agent SHALL provide a user-friendly error message
-4. WHEN data sources are unavailable THEN the system SHALL operate with reduced functionality using cached data
-5. WHEN confidence in medicine identification is low THEN the Medicine Identifier Agent SHALL present multiple options to the user
+1. WHEN a patient sends a message via the chat interface THEN the Communicator Agent SHALL process it and respond in conversational language
+2. WHEN the user writes in Hindi, English, Hinglish, or regional languages (in regional or English alphabets) THEN the Communicator Agent SHALL detect the language and respond in the same language and tone
+3. WHEN generating patient responses THEN the Communicator Agent SHALL summarize the interaction assessment in 4-5 simple, direct sentences
+4. WHEN severity is MODERATE or HIGH THEN the response SHALL include clear actionable advice (e.g., "Talk to your doctor before taking these together")
+5. WHEN technical terms must be used THEN the Communicator Agent SHALL explain them in simple language
+6. WHEN the assessment is uncertain THEN the response SHALL advise consulting a healthcare provider without causing unnecessary alarm
 
-### Requirement 11
+### Requirement 10: Two Workflow Architecture
 
-**User Story:** As a healthcare provider, I want interaction results to cite evidence sources, so that I can verify the information and assess its reliability.
-
-#### Acceptance Criteria
-
-1. WHEN an interaction is reported THEN the system SHALL include the evidence source type (curated database, clinical study, case report, or mechanism inference)
-2. WHEN research papers support an interaction THEN the system SHALL include PubMed IDs or DOIs
-3. WHEN an interaction is inferred from pharmacodynamic effects THEN the system SHALL clearly label it as inferred rather than directly documented
-4. WHEN CYP450 pathway interactions are identified THEN the system SHALL specify which enzyme pathways are involved
-5. WHEN evidence quality varies THEN the system SHALL indicate the evidence level (high, medium, or low)
-
-### Requirement 12
-
-**User Story:** As a system administrator, I want to use a curated interaction database, so that common interactions are checked quickly and reliably.
+**User Story:** As a system architect, I want two separate CrewAI Flows for professional and patient users that share common data gathering agents, so that the system efficiently serves both user types.
 
 #### Acceptance Criteria
 
-1. WHEN the system initializes THEN it SHALL load the curated interaction database into memory
-2. WHEN a medicine pair is queried THEN the Interaction Checker Agent SHALL search the curated database in under 100 milliseconds
-3. WHEN the curated database contains an interaction THEN the system SHALL use that data as the primary source
-4. WHEN the curated database is updated THEN the system SHALL reload the data without requiring a restart
-5. WHEN the curated database contains at least 100 interaction pairs THEN the system SHALL be considered ready for hackathon demonstration
+1. WHEN the system initializes THEN it SHALL create two CrewAI Flows: Professional Flow and Patient Flow
+2. WHEN either flow executes THEN both SHALL use the same AYUSH Data Agent and Allopathy Data Agent for parallel data gathering
+3. WHEN the Professional Flow completes data gathering THEN it SHALL use a Reasoning Agent that generates structured technical output for UI rendering
+4. WHEN the Patient Flow completes data gathering THEN it SHALL use a Communicator Agent that generates friendly, multilingual chat responses
+5. WHEN routing a request THEN the system SHALL determine the appropriate flow based on the interface (web = Professional, chat = Patient)
 
+### Requirement 11: Local Data Preparation
 
-### Requirement 13
+**User Story:** As a developer preparing for the hackathon, I want pre-extracted local data for reliability, so that the demo works even if web scraping fails.
+
+#### Acceptance Criteria
+
+1. WHEN preparing local data THEN the system SHALL extract medicinal plant names, common names, and phytochemical links from IMPPAT website and store in a local JSON file
+2. WHEN preparing local data THEN the system SHALL include ADMET properties for at least 20 priority AYUSH herbs (Ashwagandha, Turmeric, Brahmi, Triphala, etc.)
+3. WHEN preparing local data THEN the system SHALL include CYP metabolism data for at least 50 common allopathic drugs
+4. WHEN preparing local data THEN the system SHALL include at least 30 pre-curated critical interaction pairs with full evidence
+5. WHEN real-time scraping fails THEN the system SHALL automatically and silently fallback to local cached data
+6. WHEN using fallback data THEN the system SHALL inform the user that results are from cached data (in professional mode only)
+
+### Requirement 12: Error Handling and Graceful Degradation
+
+**User Story:** As a user, I want the system to handle errors gracefully, so that I receive useful information even when some data sources are unavailable.
+
+#### Acceptance Criteria
+
+1. WHEN web scraping encounters an error THEN the system SHALL log the error and fallback to local cached data without user-visible error messages
+2. WHEN a medicine is not found in any source THEN the system SHALL inform the user and suggest checking the spelling or trying alternative names
+3. WHEN all data sources fail THEN the system SHALL provide a user-friendly message and recommend consulting a pharmacist
+4. WHEN partial data is available THEN the system SHALL proceed with available data and clearly indicate which information is missing
+5. WHEN the LLM fails to generate a response THEN the system SHALL provide a template-based fallback response with available data
+
+### Requirement 13: Conversation Context (Chat Interface)
+
+**User Story:** As a patient using the chat interface, I want to have follow-up conversations, so that I can ask additional questions about the same medicines.
+
+#### Acceptance Criteria
+
+1. WHEN a user sends a follow-up message THEN the Orchestrator SHALL maintain conversation context from previous turns
+2. WHEN a user references "those medicines" or "the interaction" THEN the system SHALL resolve the reference from conversation history
+3. WHEN a user asks for more details THEN the system SHALL provide additional information from the already-gathered data
+4. WHEN a user wants to check different medicines THEN the system SHALL start a new data gathering process
+5. WHEN the conversation is inactive for 30 minutes THEN the system SHALL expire the session and start fresh
+
+### Requirement 14: Medical Disclaimers
 
 **User Story:** As a user receiving health information, I want to see appropriate disclaimers, so that I understand this tool does not replace professional medical advice.
 
 #### Acceptance Criteria
 
-1. WHEN an interaction result is displayed THEN the Explanation Agent SHALL include a disclaimer that this is for informational purposes only
-2. WHEN severity is Warning or Danger THEN the Explanation Agent SHALL explicitly recommend consulting a doctor or pharmacist
-3. WHEN the system provides recommendations THEN it SHALL NOT advise stopping or changing medication dosage without consulting a healthcare provider
-4. WHEN a user asks for medical advice beyond interaction checking THEN the Orchestrator Agent SHALL redirect them to consult a healthcare professional
+1. WHEN an interaction result is displayed THEN the system SHALL include a disclaimer that this is for informational purposes only
+2. WHEN severity is MODERATE or HIGH THEN the system SHALL explicitly recommend consulting a doctor or pharmacist
+3. WHEN providing recommendations THEN the system SHALL NOT advise stopping or changing medication dosage without consulting a healthcare provider
+4. WHEN a user asks for medical advice beyond interaction checking THEN the system SHALL redirect them to consult a healthcare professional
 5. WHEN the system cannot determine interaction status THEN it SHALL advise the user to consult a pharmacist rather than assuming safety
 
-### Requirement 14
+### Requirement 15: Demo Reliability
 
-**User Story:** As a user in India, I want to access the system via WhatsApp, so that I can check interactions using a familiar platform without installing a new app.
-
-#### Acceptance Criteria
-
-1. WHEN a user sends a message via WhatsApp THEN the system SHALL process the message through the Orchestrator Agent
-2. WHEN responding via WhatsApp THEN the system SHALL format responses appropriately for the WhatsApp message format
-3. WHEN displaying severity levels via WhatsApp THEN the system SHALL use emoji indicators (🟢 Safe, 🟡 Caution, 🟠 Warning, 🔴 Danger)
-4. WHEN a conversation spans multiple messages THEN the system SHALL maintain session context for at least 30 minutes of inactivity
-5. WHEN the web interface is used THEN the system SHALL provide equivalent functionality to the WhatsApp interface
-
-### Requirement 15
-
-**User Story:** As an Interaction Checker Agent, I want to categorize medicines by their pharmacodynamic effects, so that I can identify potential additive or antagonistic interactions even without direct evidence.
+**User Story:** As a hackathon presenter, I want reliable demo scenarios, so that the system performs consistently during the presentation.
 
 #### Acceptance Criteria
 
-1. WHEN a medicine is identified THEN the system SHALL categorize it into one or more effect categories (Blood Sugar Lowering, Blood Pressure Lowering, Blood Thinning, Sedation/CNS Depression, Immune Modulation, Hepatotoxic, Nephrotoxic)
-2. WHEN two medicines share the same effect category THEN the Interaction Checker Agent SHALL flag a potential additive effect interaction
-3. WHEN two medicines have opposing effect categories THEN the Interaction Checker Agent SHALL flag a potential antagonistic interaction
-4. WHEN an AYUSH medicine's effect category is unknown THEN the system SHALL attempt to infer from its traditional use and known active compounds
-5. WHEN effect category matching identifies a potential interaction THEN the system SHALL clearly label it as inferred from pharmacodynamic similarity
+1. WHEN preparing for demo THEN the system SHALL have pre-identified medicine pairs where web scraping works reliably
+2. WHEN demonstrating THEN the presenter SHALL use pre-tested scenarios that showcase real-time data gathering
+3. WHEN web scraping fails during demo THEN the automatic fallback SHALL provide seamless experience with cached data
+4. WHEN discussing limitations THEN the presentation SHALL mention the need for commercial API access (DrugBank, IMPPAT) for production
+5. WHEN caching THEN the system SHALL implement a caching layer to store successful web scrape results for reuse
 
-### Requirement 16
+### Requirement 16: Pharmacodynamic Effect Analysis
 
-**User Story:** As a user who wants to share results with my doctor, I want to generate a summary report, so that I can have an informed discussion during my consultation.
+**User Story:** As an Interaction Checker, I want to identify pharmacodynamic overlaps even when CYP data is unavailable, so that I can detect additive or antagonistic effects.
 
 #### Acceptance Criteria
 
-1. WHEN a user requests a report THEN the system SHALL generate a structured summary of all medicines checked and interactions found
-2. WHEN generating a report THEN the system SHALL include medicine names, interaction details, severity levels, and evidence sources
-3. WHEN generating a report THEN the system SHALL format it as shareable text suitable for copying or forwarding
-4. WHEN the report is generated THEN it SHALL include the date and time of the interaction check
-5. WHEN the report is generated THEN it SHALL include a note recommending discussion with a healthcare provider
+1. WHEN analyzing interactions THEN the Reasoning Agent SHALL check for overlapping pharmacodynamic effects (e.g., both cause sedation, both lower blood sugar)
+2. WHEN two medicines share the same effect category THEN the agent SHALL flag a potential additive interaction
+3. WHEN two medicines have opposing effects THEN the agent SHALL flag a potential antagonistic interaction
+4. WHEN pharmacodynamic effects are identified THEN the agent SHALL describe the potential clinical outcome (e.g., "Additive hypoglycemic effect may cause dangerously low blood sugar")
+5. WHEN both CYP and pharmacodynamic interactions are found THEN the agent SHALL report both mechanisms
+
+### Requirement 17: Research Article Search
+
+**User Story:** As a Reasoning Agent, I want to search for relevant research articles, so that I can provide evidence-based interaction assessments.
+
+#### Acceptance Criteria
+
+1. WHEN analyzing an interaction THEN the Reasoning Agent SHALL perform web search to find relevant research articles about the specific drug combination
+2. WHEN research articles are found THEN the agent SHALL extract key findings about interaction effects
+3. WHEN research supports an interaction THEN the agent SHALL cite the source with URL and summarize the finding
+4. WHEN research contradicts other sources THEN the agent SHALL include both findings and note the conflict
+5. WHEN no relevant research is found THEN the agent SHALL note "No specific research found for this combination" and rely on mechanism-based inference
