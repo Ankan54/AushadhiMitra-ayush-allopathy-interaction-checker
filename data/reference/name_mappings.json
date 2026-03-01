@@ -1,0 +1,75 @@
+{
+  "version": "1.0",
+  "last_updated": "2026-02-28",
+  "plants": [
+    {
+      "scientific_name": "Curcuma longa",
+      "common_names": ["turmeric", "curcumin"],
+      "hindi_names": ["haldi"],
+      "brand_names": ["Himalaya Turmeric", "Organic India Turmeric"],
+      "imppat_file": "Curcuma_longa/plant_data.json",
+      "key_phytochemicals": ["curcumin", "demethoxycurcumin", "bisdemethoxycurcumin"],
+      "known_cyp_effects": {
+        "CYP2C9": "inhibitor",
+        "CYP3A4": "inhibitor",
+        "CYP1A2": "inhibitor"
+      },
+      "effect_categories": ["anti_inflammatory", "antiplatelet", "antioxidant"]
+    },
+    {
+      "scientific_name": "Glycyrrhiza glabra",
+      "common_names": ["licorice", "liquorice", "glycyrrhiza"],
+      "hindi_names": ["mulethi", "yashtimadhu"],
+      "brand_names": ["Himalaya Yashtimadhu"],
+      "imppat_file": "Glycyrrhiza_glabra/plant_data.json",
+      "key_phytochemicals": ["glycyrrhizin", "glycyrrhetinic acid", "liquiritigenin"],
+      "known_cyp_effects": {
+        "CYP3A4": "inhibitor",
+        "CYP2B6": "inhibitor",
+        "CYP2C9": "inhibitor"
+      },
+      "effect_categories": ["mineralocorticoid", "anti_inflammatory", "hypokalemic"]
+    },
+    {
+      "scientific_name": "Zingiber officinale",
+      "common_names": ["ginger"],
+      "hindi_names": ["adrak", "sonth"],
+      "brand_names": ["Himalaya Ginger"],
+      "imppat_file": "Zingiber_officinale/plant_data.json",
+      "key_phytochemicals": ["gingerol", "shogaol", "zingerone"],
+      "known_cyp_effects": {
+        "CYP2C9": "inhibitor",
+        "CYP2C19": "inhibitor"
+      },
+      "effect_categories": ["antiplatelet", "anti_inflammatory", "antiemetic"]
+    },
+    {
+      "scientific_name": "Hypericum perforatum",
+      "common_names": ["st. john's wort", "st johns wort", "saint john's wort"],
+      "hindi_names": [],
+      "brand_names": ["Nature's Bounty St. John's Wort"],
+      "imppat_file": "Hypericum_perforatum/plant_data.json",
+      "key_phytochemicals": ["hypericin", "hyperforin", "adhyperforin"],
+      "known_cyp_effects": {
+        "CYP3A4": "inducer",
+        "CYP2C9": "inducer",
+        "CYP2C19": "inducer",
+        "CYP1A2": "inducer"
+      },
+      "effect_categories": ["antidepressant", "cyp_inducer"]
+    },
+    {
+      "scientific_name": "Withania somnifera",
+      "common_names": ["ashwagandha", "indian ginseng", "winter cherry"],
+      "hindi_names": ["ashwagandha", "asgandh"],
+      "brand_names": ["Himalaya Ashwagandha", "KSM-66"],
+      "imppat_file": "Withania_somnifera/plant_data.json",
+      "key_phytochemicals": ["withaferin a", "withanolide d", "withanone", "withanoside iv"],
+      "known_cyp_effects": {
+        "CYP3A4": "inhibitor",
+        "CYP2D6": "inhibitor"
+      },
+      "effect_categories": ["adaptogen", "anti_inflammatory", "immunomodulatory", "anxiolytic"]
+    }
+  ]
+}

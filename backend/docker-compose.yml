@@ -1,0 +1,38 @@
+version: "3.8"
+
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - AWS_REGION=us-east-1
+      - PLANNER_AGENT_ID=JRARFMAC40
+      - PLANNER_AGENT_ALIAS=BAKMQ02PQ7
+      - AYUSH_AGENT_ID=0SU1BHJ78L
+      - AYUSH_AGENT_ALIAS=6NXIKPLBVB
+      - ALLOPATHY_AGENT_ID=CNAZG8LA0H
+      - ALLOPATHY_AGENT_ALIAS=BBAJ5HFGKG
+      - REASONING_AGENT_ID=03NGZ4CNF3
+      - REASONING_AGENT_ALIAS=DUH94OH0OG
+      - FLOW_ID=4QKIL1MSB5
+      - FLOW_ALIAS=CZZIUM9U5W
+      - BEDROCK_AGENT_ID=8MIQNGTVWG
+      - BEDROCK_AGENT_ALIAS_ID=IPQMNOORBI
+      - DB_HOST=scm-postgres.c2na6oc62pb7.us-east-1.rds.amazonaws.com
+      - DB_PORT=5432
+      - DB_NAME=aushadhimitra
+      - DB_USER=scm_admin
+      - DB_PASSWORD=${DB_PASSWORD:?Set DB_PASSWORD}
+      - DB_SSL=require
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf
+    depends_on:
+      - app
+    restart: unless-stopped

@@ -1,0 +1,71 @@
+{
+  "version": "1.0",
+  "last_updated": "2026-02-28",
+  "description": "Narrow Therapeutic Index drugs where small changes in blood levels can cause serious toxicity",
+  "nti_drugs": [
+    {
+      "generic_name": "Warfarin",
+      "brand_names": ["Coumadin", "Jantoven"],
+      "drug_class": "Anticoagulant",
+      "primary_cyp_substrates": ["CYP2C9", "CYP3A4", "CYP1A2"],
+      "effect_categories": ["blood_thinning", "anticoagulant"],
+      "clinical_concern": "Bleeding risk, INR elevation"
+    },
+    {
+      "generic_name": "Digoxin",
+      "brand_names": ["Lanoxin"],
+      "drug_class": "Cardiac Glycoside",
+      "primary_cyp_substrates": ["P-gp"],
+      "effect_categories": ["cardiac", "inotropic"],
+      "clinical_concern": "Fatal arrhythmia, toxicity"
+    },
+    {
+      "generic_name": "Cyclosporine",
+      "brand_names": ["Sandimmune", "Neoral", "Gengraf"],
+      "drug_class": "Immunosuppressant",
+      "primary_cyp_substrates": ["CYP3A4"],
+      "effect_categories": ["immunosuppressant"],
+      "clinical_concern": "Organ rejection, nephrotoxicity"
+    },
+    {
+      "generic_name": "Tacrolimus",
+      "brand_names": ["Prograf"],
+      "drug_class": "Immunosuppressant",
+      "primary_cyp_substrates": ["CYP3A4"],
+      "effect_categories": ["immunosuppressant"],
+      "clinical_concern": "Organ rejection, nephrotoxicity"
+    },
+    {
+      "generic_name": "Phenytoin",
+      "brand_names": ["Dilantin"],
+      "drug_class": "Anticonvulsant",
+      "primary_cyp_substrates": ["CYP2C9", "CYP2C19"],
+      "effect_categories": ["anticonvulsant"],
+      "clinical_concern": "CNS toxicity, ataxia"
+    },
+    {
+      "generic_name": "Lithium",
+      "brand_names": ["Lithobid", "Eskalith"],
+      "drug_class": "Mood Stabilizer",
+      "primary_cyp_substrates": [],
+      "effect_categories": ["mood_stabilizer"],
+      "clinical_concern": "Lithium toxicity, renal damage"
+    },
+    {
+      "generic_name": "Theophylline",
+      "brand_names": ["Theo-24", "Elixophyllin"],
+      "drug_class": "Bronchodilator",
+      "primary_cyp_substrates": ["CYP1A2", "CYP3A4"],
+      "effect_categories": ["bronchodilator"],
+      "clinical_concern": "Seizures, cardiac arrhythmia"
+    },
+    {
+      "generic_name": "Methotrexate",
+      "brand_names": ["Trexall", "Otrexup"],
+      "drug_class": "Antimetabolite",
+      "primary_cyp_substrates": [],
+      "effect_categories": ["immunosuppressant", "anticancer"],
+      "clinical_concern": "Bone marrow suppression, hepatotoxicity"
+    }
+  ]
+}
