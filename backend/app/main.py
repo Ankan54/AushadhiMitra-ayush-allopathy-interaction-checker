@@ -1,8 +1,8 @@
-"""AushadhiMitra FastAPI Backend V3 - serves React UI + WebSocket trace streaming.
+"""AushadhiMitra FastAPI Backend V4 — serves React UI + WebSocket trace streaming.
 
-Pipeline architecture with validation loop-back:
-  Planner → AYUSH → Allopathy → Reasoning+Validation → (loop if NEEDS_MORE_DATA) → Output
-  Each agent invoked individually with streaming traces via WebSocket.
+Architecture: Bedrock Flow with DoWhile validation loop (pipeline fallback).
+  FlowInput → Planner → DoWhile { AYUSH, Allopathy, Merge, Reasoning, Validation } → Output
+  Streams both flow-level and agent-level traces via WebSocket.
 """
 import json
 import uuid
@@ -14,12 +14,13 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import ValidationError
 
 from app.config import (
     PLANNER_AGENT_ID, AYUSH_AGENT_ID, ALLOPATHY_AGENT_ID,
     REASONING_AGENT_ID, FLOW_ID, DB_NAME,
 )
-from app.agent_service import run_interaction_pipeline, invoke_agent_streaming
+from app.agent_service import run_check, run_interaction_pipeline, invoke_agent_streaming
 from app.db import lookup_curated, get_sources, save_interaction, list_interactions
 from app.models import InteractionRequest, HealthResponse
 
@@ -28,8 +29,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="AushadhiMitra API",
-    description="AYUSH-Allopathy Drug Interaction Checker - Pipeline Architecture",
-    version="3.0.0",
+    description="AYUSH-Allopathy Drug Interaction Checker — Flow V4 DoWhile Loop",
+    version="4.0.0",
 )
 
 app.add_middleware(
@@ -51,15 +52,15 @@ def _serialize(obj):
 async def health():
     return {
         "status": "healthy",
-        "architecture": "pipeline_v3_validation_loopback",
-        "max_validation_retries": 2,
+        "architecture": "flow_v4_dowhile_loop",
+        "execution_mode": "flow_with_pipeline_fallback",
+        "flow": {"id": FLOW_ID, "version": "4", "type": "DoWhile"},
         "agents": {
             "planner": PLANNER_AGENT_ID,
             "ayush": AYUSH_AGENT_ID,
             "allopathy": ALLOPATHY_AGENT_ID,
             "reasoning": REASONING_AGENT_ID,
         },
-        "flow_id": FLOW_ID,
         "database": DB_NAME,
     }
 
@@ -86,7 +87,7 @@ async def check_interaction_rest(req: InteractionRequest):
         }, default=_serialize)))
 
     full_text = ""
-    for event_type, data in run_interaction_pipeline(req.ayush_name, req.allopathy_name):
+    for event_type, data in run_check(req.ayush_name, req.allopathy_name):
         if event_type == "response":
             full_text += data
         elif event_type == "error":
@@ -99,37 +100,63 @@ async def check_interaction_rest(req: InteractionRequest):
 async def ws_check_interaction(websocket: WebSocket):
     """WebSocket endpoint for real-time pipeline trace streaming.
 
+    Expected input: {"ayush_name": "...", "allopathy_name": "...", "mode": "auto|flow|pipeline"}
+
     Sends structured events:
-    - {type: "status", message: "..."}          — pipeline status
-    - {type: "trace", agent: "...", ...}        — agent trace events
-    - {type: "cached_result", ...}              — cached result found
-    - {type: "response_chunk", text: "..."}     — final response text
-    - {type: "complete", ...}                   — pipeline finished
-    - {type: "error", message: "..."}           — error occurred
+      {type: "status",         message: "..."}
+      {type: "trace",          data: {...}}
+      {type: "agent_complete", agent: "...", preview: "..."}
+      {type: "validation",     status: "...", ...}
+      {type: "cached_result",  interaction: {...}, sources: [...]}
+      {type: "response_chunk", text: "..."}
+      {type: "complete",       full_response: "...", ...}
+      {type: "error",          message: "..."}
     """
     await websocket.accept()
 
     try:
         data = await websocket.receive_json()
-        ayush_name = data.get("ayush_name", "")
-        allopathy_name = data.get("allopathy_name", "")
+        ayush_name = (data.get("ayush_name") or "").strip()
+        allopathy_name = (data.get("allopathy_name") or "").strip()
 
-        if not ayush_name or not allopathy_name:
+        # Validate via Pydantic model (reuses field_validator rules)
+        try:
+            validated = InteractionRequest(
+                ayush_name=ayush_name, allopathy_name=allopathy_name
+            )
+            ayush_name = validated.ayush_name
+            allopathy_name = validated.allopathy_name
+        except ValidationError as e:
+            error_messages = "; ".join(
+                err.get("msg", "") for err in e.errors()
+            )
             await websocket.send_json({
                 "type": "error",
-                "message": "Both ayush_name and allopathy_name are required",
+                "message": f"Invalid input: {error_messages}",
             })
             await websocket.close()
             return
 
+        mode = data.get("mode", "auto")
+        if mode not in ("auto", "flow", "pipeline"):
+            mode = "auto"
+
         await websocket.send_json({
             "type": "status",
-            "message": "Checking curated database...",
+            "message": f"Checking curated database for {ayush_name} + {allopathy_name}...",
         })
 
-        cached = lookup_curated(ayush_name, allopathy_name)
+        try:
+            cached = lookup_curated(ayush_name, allopathy_name)
+        except Exception as e:
+            logger.warning("Curated DB lookup failed: %s", e)
+            cached = None
+
         if cached:
-            sources = get_sources(cached["interaction_key"])
+            try:
+                sources = get_sources(cached["interaction_key"])
+            except Exception:
+                sources = []
             await websocket.send_json({
                 "type": "cached_result",
                 "interaction": json.loads(json.dumps(cached, default=_serialize)),
@@ -140,40 +167,40 @@ async def ws_check_interaction(websocket: WebSocket):
 
         await websocket.send_json({
             "type": "status",
-            "message": "No cached result. Starting pipeline with validation loop-back...",
+            "message": f"No cached result. Starting analysis (mode={mode})...",
         })
 
         session_id = str(uuid.uuid4())
         full_response = ""
 
-        for event_type, data in run_interaction_pipeline(
-            ayush_name, allopathy_name, session_id
+        for event_type, event_data in run_check(
+            ayush_name, allopathy_name, session_id, mode=mode
         ):
             if event_type == "trace":
-                await websocket.send_json({"type": "trace", **data})
+                await websocket.send_json({"type": "trace", "data": event_data})
 
             elif event_type == "agent_complete":
                 await websocket.send_json({
                     "type": "agent_complete",
-                    "agent": data.get("label", ""),
-                    "preview": data.get("response", "")[:300],
+                    "agent": event_data.get("label", ""),
+                    "preview": event_data.get("response", "")[:300],
                 })
 
             elif event_type == "validation":
                 await websocket.send_json({
                     "type": "validation",
-                    "status": data.get("status", "UNKNOWN"),
-                    "completeness_score": data.get("completeness_score", 0),
-                    "iteration": data.get("iteration", 0),
-                    "issues": data.get("issues", []),
-                    "missing_data": data.get("missing_data", []),
+                    "status": event_data.get("status", "UNKNOWN"),
+                    "completeness_score": event_data.get("completeness_score", 0),
+                    "iteration": event_data.get("iteration", 0),
+                    "issues": event_data.get("issues", []),
+                    "missing_data": event_data.get("missing_data", []),
                 })
 
             elif event_type == "response":
-                full_response += data
+                full_response += event_data
                 await websocket.send_json({
                     "type": "response_chunk",
-                    "text": data,
+                    "text": event_data,
                 })
 
             elif event_type == "done":
@@ -181,16 +208,18 @@ async def ws_check_interaction(websocket: WebSocket):
                     "type": "complete",
                     "full_response": full_response,
                     "session_id": session_id,
-                    "cached": data.get("cached", False),
-                    "pipeline_stages": data.get("pipeline_stages", []),
-                    "validation_iterations": data.get("validation_iterations", 0),
-                    "final_validation": data.get("final_validation", "UNKNOWN"),
+                    "cached": event_data.get("cached", False),
+                    "execution_mode": event_data.get("execution_mode", "unknown"),
+                    "loop_iterations": event_data.get("loop_iterations", 0),
+                    "pipeline_stages": event_data.get("pipeline_stages", []),
+                    "validation_iterations": event_data.get("validation_iterations", 0),
+                    "final_validation": event_data.get("final_validation", "UNKNOWN"),
                 })
 
             elif event_type == "error":
                 await websocket.send_json({
                     "type": "error",
-                    "message": data.get("message", "Unknown error"),
+                    "message": event_data.get("message", "Unknown error"),
                 })
 
         await websocket.close()
@@ -215,8 +244,8 @@ if os.path.isdir(STATIC_DIR):
         index = os.path.join(STATIC_DIR, "index.html")
         if os.path.isfile(index):
             return FileResponse(index)
-        return {"message": "AushadhiMitra API v3.0 - Pipeline with Validation Loop-back"}
+        return {"message": "AushadhiMitra API v4.0 — Flow V4 DoWhile Loop"}
 else:
     @app.get("/")
     async def root():
-        return {"message": "AushadhiMitra API v3.0 - Pipeline with Validation Loop-back"}
+        return {"message": "AushadhiMitra API v4.0 — Flow V4 DoWhile Loop"}
