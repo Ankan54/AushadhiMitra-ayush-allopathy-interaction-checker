@@ -80,7 +80,7 @@ def _load_cyp_ref() -> dict:
         return _cyp_cache
     except Exception as e:
         logger.error(f"Failed to load cyp_enzymes.json: {e}")
-        return {"enzymes": [], "severity_scoring": {}}
+        return {"enzymes": {}, "scoring_rules": {}, "severity_thresholds": {}}
 
 
 def _load_nti_ref() -> dict:
@@ -101,7 +101,9 @@ def build_knowledge_graph(ayush_name: str, allopathy_name: str,
     """Build a Cytoscape.js-compatible knowledge graph for the drug interaction."""
     try:
         interactions = json.loads(interactions_data_str) if isinstance(interactions_data_str, str) else interactions_data_str
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
+        interactions = {}
+    if not isinstance(interactions, dict):
         interactions = {}
 
     nodes = []
@@ -183,12 +185,14 @@ def calculate_severity(interactions_data_str: str, allopathy_name: str) -> dict:
     """Calculate interaction severity score based on CYP enzyme reference data and NTI status."""
     try:
         interactions = json.loads(interactions_data_str) if isinstance(interactions_data_str, str) else interactions_data_str
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
+        interactions = {}
+    if not isinstance(interactions, dict):
         interactions = {}
 
     cyp_ref = _load_cyp_ref()
     nti_ref = _load_nti_ref()
-    scoring_rules = cyp_ref.get("severity_scoring", {})
+    scoring_rules = cyp_ref.get("scoring_rules", {})
 
     base_score = 0
     factors = []
@@ -228,15 +232,15 @@ def calculate_severity(interactions_data_str: str, allopathy_name: str) -> dict:
                         [n.lower() for n in drug.get("brand_names", [])]
             if allopathy_name.lower().strip() in all_names:
                 is_nti = True
-                nti_boost = scoring_rules.get("nti_boost", 20)
+                nti_boost = scoring_rules.get("nti_drug_boost", 25)
                 base_score += nti_boost
                 factors.append(f"NTI drug status (+{nti_boost})")
                 break
 
-    thresholds = scoring_rules.get("thresholds", {})
-    major_thresh = thresholds.get("major", 30)
-    moderate_thresh = thresholds.get("moderate", 15)
-    minor_thresh = thresholds.get("minor", 5)
+    thresholds = cyp_ref.get("severity_thresholds", {})
+    major_thresh = thresholds.get("MAJOR", {}).get("min", 60)
+    moderate_thresh = thresholds.get("MODERATE", {}).get("min", 35)
+    minor_thresh = thresholds.get("MINOR", {}).get("min", 15)
 
     if base_score >= major_thresh:
         severity = "MAJOR"
@@ -250,7 +254,7 @@ def calculate_severity(interactions_data_str: str, allopathy_name: str) -> dict:
     return {
         "success": True,
         "severity": severity,
-        "severity_score": round(base_score),
+        "severity_score": min(round(base_score), 100),
         "is_nti": is_nti,
         "scoring_factors": factors,
         "thresholds": {"MINOR": minor_thresh, "MODERATE": moderate_thresh, "MAJOR": major_thresh},
@@ -265,20 +269,29 @@ def format_professional_response(ayush_name: str, allopathy_name: str,
     """Format the final professional response JSON for storage and UI display."""
     try:
         interactions = json.loads(interactions_data_str) if isinstance(interactions_data_str, str) else interactions_data_str
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
+        interactions = {}
+    if not isinstance(interactions, dict):
         interactions = {}
 
     try:
         knowledge_graph = json.loads(knowledge_graph_str) if isinstance(knowledge_graph_str, str) else knowledge_graph_str
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
+        knowledge_graph = {}
+    if not isinstance(knowledge_graph, dict):
         knowledge_graph = {}
 
     try:
         sources = json.loads(sources_str) if isinstance(sources_str, str) else sources_str
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
+        sources = []
+    if not isinstance(sources, list):
         sources = []
 
-    severity_score = int(severity_score_str) if severity_score_str else 0
+    try:
+        severity_score = int(severity_score_str) if severity_score_str else 0
+    except (ValueError, TypeError):
+        severity_score = 0
 
     interaction_key = f"{ayush_name.lower().strip()}#{allopathy_name.lower().strip()}"
 

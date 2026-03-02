@@ -110,12 +110,16 @@ def allopathy_cache_save(drug_name: str, generic_name: str,
 
     try:
         drug_data = json.loads(drug_data_str) if isinstance(drug_data_str, str) else drug_data_str
-    except json.JSONDecodeError:
-        drug_data = {"raw": drug_data_str}
+    except (json.JSONDecodeError, TypeError):
+        drug_data = {"raw": str(drug_data_str) if drug_data_str else ""}
+    if not isinstance(drug_data, dict):
+        drug_data = {"raw": str(drug_data_str) if drug_data_str else ""}
 
     try:
         sources = json.loads(sources_str) if isinstance(sources_str, str) else sources_str
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
+        sources = []
+    if not isinstance(sources, list):
         sources = []
 
     conn = get_db()
@@ -157,7 +161,7 @@ def check_nti_status(drug_name: str) -> dict:
                 "is_nti": True,
                 "generic_name": drug["generic_name"],
                 "drug_class": drug.get("drug_class", ""),
-                "primary_cyp_substrate": drug.get("primary_cyp_substrate", []),
+                "primary_cyp_substrates": drug.get("primary_cyp_substrates", []),
                 "clinical_concern": drug.get("clinical_concern", ""),
                 "severity_boost": "Severity should be elevated due to Narrow Therapeutic Index status",
             }

@@ -597,8 +597,8 @@ def _extract_validation(response_text: str) -> dict:
         return {"validation_status": "NEEDS_MORE_DATA", "completeness_score": 50,
                 "issues": ["Validation JSON not parseable"], "missing_data": []}
 
-    return {"validation_status": "PASSED", "completeness_score": 80,
-            "issues": [], "missing_data": []}
+    return {"validation_status": "NEEDS_MORE_DATA", "completeness_score": 50,
+            "issues": ["Validation response could not be parsed"], "missing_data": []}
 
 
 def _determine_retry_agents(validation: dict) -> dict:

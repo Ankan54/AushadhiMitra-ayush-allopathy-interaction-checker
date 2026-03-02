@@ -153,7 +153,7 @@ def check_curated_interaction(ayush_name: str, allopathy_name: str) -> dict:
         interaction_key = f"{ayush_name.lower().strip()}#{allopathy_name.lower().strip()}"
         cur.execute(
             """SELECT interaction_key, ayush_name, allopathy_name, severity,
-                      severity_score, interaction_data, knowledge_graph, created_at
+                      severity_score, response_data, knowledge_graph, created_at
                FROM curated_interactions
                WHERE interaction_key = %s""",
             (interaction_key,),
@@ -166,7 +166,7 @@ def check_curated_interaction(ayush_name: str, allopathy_name: str) -> dict:
                 "interaction_key": data["interaction_key"],
                 "severity": data.get("severity", ""),
                 "severity_score": data.get("severity_score", 0),
-                "interaction_data": data.get("interaction_data", {}),
+                "interaction_data": data.get("response_data", {}),
                 "knowledge_graph": data.get("knowledge_graph", {}),
                 "cached": True,
             }

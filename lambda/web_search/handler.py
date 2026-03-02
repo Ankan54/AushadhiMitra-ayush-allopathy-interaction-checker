@@ -45,7 +45,7 @@ SOURCE_CATEGORIES = [
                             "nccih.nih.gov", "ayush.gov.in"]),
     ("medical_reference", ["webmd.com", "mayoclinic.org", "medlineplus.gov",
                             "msdmanuals.com", "uptodate.com"]),
-    ("herbal_database", ["examine.com", "herbalgram.org", "imppat.curie",
+    ("herbal_database", ["examine.com", "herbalgram.org", "https://cb.imsc.res.in/imppat/https://cb.imsc.res.in/imppat/",
                          "consumerlab.com", "naturalstandard.com"]),
 ]
 
@@ -59,10 +59,14 @@ def lambda_handler(event, context):
 
     try:
         if function == "web_search":
+            try:
+                max_results = int(params.get("max_results", "5"))
+            except (ValueError, TypeError):
+                max_results = 5
             result = web_search(
                 params.get("query", ""),
-                params.get("search_depth", "basic"),
-                int(params.get("max_results", "5")),
+                params.get("search_depth", "advanced"),
+                max_results,
             )
         else:
             result = {"error": f"Unknown function: {function}"}

@@ -2,1094 +2,455 @@
 
 ## Overview
 
-AushadhiMitra is a multi-agent AI system that checks for drug interactions between AYUSH (traditional Indian medicine) and allopathic (modern pharmaceutical) medicines. The system uses **Amazon Bedrock Agents with Multi-Agent Collaboration** to orchestrate a tiered approach: instant responses from a curated interaction database for high-impact pairs (Layer 0), and real-time data gathering via Tavily web search for other queries with S3 fallback for reliability.
+AushadhiMitra is a multi-agent AI system that checks for drug interactions between AYUSH (traditional Indian medicine) and allopathic (modern pharmaceutical) medicines. The system uses **Amazon Bedrock Agents with Bedrock Flow V4** to orchestrate a tiered, self-validating pipeline: instant responses from a PostgreSQL curated database for high-impact pairs (Layer 0), and real-time multi-agent analysis with a DoWhile validation loop for other queries. A Pipeline Mode fallback handles Bedrock Flow timeouts.
 
-The architecture features 1 Supervisor Agent and 3 Collaborator Agents (AYUSH Agent, Allopathy Agent, Reasoning Agent), with AWS Lambda functions serving as Action Groups for deterministic operations. A key differentiator is the dynamic knowledge graph generation that visually maps interaction pathways.
+The backend is a **FastAPI application** with WebSocket streaming, deployed on Docker + Nginx. AWS Lambda functions serve as Action Groups for all deterministic operations. A dynamic JSON knowledge graph maps interaction pathways and is rendered on the frontend via Cytoscape.js.
 
 **Key Design Principles:**
-- **AWS Managed Services**: Bedrock Agents, Lambda, S3, DynamoDB, API Gateway
-- **Multi-Agent Collaboration**: Supervisor routes to specialized collaborators
-- **Tiered Response**: Curated instant responses (Layer 0) → Real-time gathering → S3 fallback
-- **Serverless Architecture**: Lambda-based action groups for scalability
-- **Grounded Reasoning**: LLM uses ONLY provided evidence, not internal knowledge
-- **Transparent Conflict Detection**: As a differentiator feature
-- **Full Source Citation**: With clickable URLs for verification
+- **AWS Managed Services**: Bedrock Agents, Bedrock Flows, Lambda, S3, DynamoDB, RDS PostgreSQL
+- **Bedrock Flow V4 + DoWhile**: Self-validating agent loop (max 3 iterations) with inline validation parser
+- **Pipeline Fallback**: FastAPI-orchestrated direct agent invocation when Flow times out
+- **Tiered Response**: Layer 0 (curated instant, <500ms) → Real-time multi-agent analysis → Graceful degradation
+- **Grounded Reasoning**: LLM uses ONLY provided evidence from Lambda data sources
+- **WebSocket Streaming**: Real-time agent trace events streamed to frontend
+- **Full Source Citation**: Clickable URLs for every claim (PubMed, DrugBank, IMPPAT, Tavily)
 
 **Architecture Summary:**
-- **1 Supervisor Agent**: Routes requests and orchestrates workflow
-- **3 Collaborator Agents**: AYUSH Agent, Allopathy Agent, Reasoning Agent
-- **9 Lambda Action Groups**: Deterministic business logic functions
-- **Data Storage**: S3 (static data), DynamoDB (cache)
+- **1 Planner Agent** (Claude 3 Sonnet): Routes requests, checks curated DB
+- **3 Collaborator Agents**: AYUSH Agent (Claude 3 Haiku), Allopathy Agent (Claude 3 Haiku), Reasoning Agent (Claude 3 Sonnet)
+- **12 Lambda Action Groups**: Deterministic business logic functions
+- **Data Storage**: S3 (reference data), DynamoDB (IMPPAT phytochemicals), RDS PostgreSQL (curated DB + allopathy cache)
+- **FastAPI Backend**: REST + WebSocket API, Docker + Nginx deployment
+
+---
 
 ## AWS Architecture
 
 ### System Architecture Diagram
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              USER INTERFACES                                 │
-│  ┌─────────────────────────────┐    ┌─────────────────────────────────┐     │
-│  │   React Web UI              │    │   Streamlit Chat UI             │     │
-│  │   (Professional)            │    │   (Patient)                     │     │
-│  │   - Cytoscape.js KG         │    │   - Simple chat                 │     │
-│  │   - AWS Amplify hosted      │    │   - Hindi/English/Hinglish      │     │
-│  └──────────────┬──────────────┘    └──────────────┬──────────────────┘     │
-└─────────────────┼──────────────────────────────────┼────────────────────────┘
-                  │                                  │
-                  └──────────────┬───────────────────┘
-                                 ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         AMAZON API GATEWAY                                   │
-│                    (REST API for agent invocation)                          │
-└─────────────────────────────────┬───────────────────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    AMAZON BEDROCK AGENTS                                     │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │                     SUPERVISOR AGENT                                   │  │
-│  │  Model: Claude 3 Sonnet                                               │  │
-│  │  Role: Route requests, orchestrate collaborators, synthesize results  │  │
-│  │                                                                       │  │
-│  │  Instructions:                                                        │  │
-│  │  - Parse user input to identify AYUSH and allopathic medicines       │  │
-│  │  - Check curated database first for instant response                 │  │
-│  │  - Route to AYUSH and Allopathy agents in parallel                   │  │
-│  │  - Pass results to Reasoning agent for analysis                      │  │
-│  │  - Format final response based on user type                          │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-│                                  │                                           │
-│          ┌───────────────────────┼───────────────────────┐                  │
-│          ▼                       ▼                       ▼                  │
-│  ┌───────────────┐      ┌───────────────┐      ┌───────────────┐           │
-│  │ AYUSH AGENT   │      │ ALLOPATHY     │      │ REASONING     │           │
-│  │ (Collaborator)│      │ AGENT         │      │ AGENT         │           │
-│  │               │      │ (Collaborator)│      │ (Collaborator)│           │
-│  │ Model: Haiku  │      │ Model: Haiku  │      │ Model: Sonnet │           │
-│  │               │      │               │      │               │           │
-│  │ Action Groups:│      │ Action Groups:│      │ Action Groups:│           │
-│  │ • name_resolve│      │ • cache_lookup│      │ • build_kg    │           │
-│  │ • imppat_load │      │ • web_search  │      │ • calc_severity│          │
-│  │ • web_search  │      │ • cache_save  │      │ • web_search  │           │
-│  │               │      │               │      │ • format_pro  │           │
-│  └───────┬───────┘      └───────┬───────┘      └───────┬───────┘           │
-└──────────┼──────────────────────┼──────────────────────┼────────────────────┘
-           │                      │                      │
-           ▼                      ▼                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         AWS LAMBDA FUNCTIONS                                 │
-│                         (Action Group Handlers)                             │
-│  ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐               │
-│  │ayush_name_      │ │cache_lookup     │ │build_knowledge_ │               │
-│  │resolver         │ │                 │ │graph            │               │
-│  │Python 3.12      │ │Python 3.12      │ │Python 3.12      │               │
-│  └─────────────────┘ └─────────────────┘ └─────────────────┘               │
-│  ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐               │
-│  │imppat_lookup    │ │web_search_tavily│ │calculate_       │               │
-│  │                 │ │                 │ │severity         │               │
-│  │Python 3.12      │ │Python 3.12      │ │Python 3.12      │               │
-│  └─────────────────┘ └─────────────────┘ └─────────────────┘               │
-│  ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐               │
-│  │cache_save       │ │check_curated_db │ │format_          │               │
-│  │                 │ │                 │ │professional_    │               │
-│  │Python 3.12      │ │Python 3.12      │ │response         │               │
-│  └─────────────────┘ └─────────────────┘ └─────────────────┘               │
-└─────────────────────────────────────────────────────────────────────────────┘
-           │                      │                      │
-           ▼                      ▼                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           DATA LAYER                                         │
-│  ┌───────────────────────────┐    ┌───────────────────────────────┐        │
-│  │      AMAZON S3            │    │      AMAZON DYNAMODB          │        │
-│  │  (Static Data)            │    │  (Cache)                      │        │
-│  │                           │    │                               │        │
-│  │  /curated/                │    │  Table: allopathy_cache       │        │
-│  │    curated_interactions   │    │    PK: drug_name              │        │
-│  │  /ayush/imppat/           │    │    TTL: 7 days                │        │
-│  │    curcuma_longa.json     │    │                               │        │
-│  │    glycyrrhiza_glabra.json│    │  Table: kg_cache              │        │
-│  │    zingiber_officinale    │    │    PK: ayush#allopathy        │        │
-│  │    hypericum_perforatum   │    │    TTL: 30 days               │        │
-│  │  /reference/              │    │                               │        │
-│  │    nti_drugs.json         │    │                               │        │
-│  │    cyp_enzymes.json       │    │                               │        │
-│  └───────────────────────────┘    └───────────────────────────────┘        │
-└─────────────────────────────────────────────────────────────────────────────┘
-           │
-           ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        EXTERNAL SERVICES                                     │
-│  ┌───────────────────────────┐    ┌───────────────────────────────┐        │
-│  │      TAVILY API           │    │   AWS SECRETS MANAGER         │        │
-│  │  (Web Search)             │    │   (API Keys)                  │        │
-│  │                           │    │                               │        │
-│  │  - DrugBank search        │    │   - TAVILY_API_KEY            │        │
-│  │  - Research articles      │    │                               │        │
-│  │  - CYP inducer data       │    │                               │        │
-│  └───────────────────────────┘    └───────────────────────────────┘        │
-└─────────────────────────────────────────────────────────────────────────────┘
+User (Browser/Chat)
+        │
+        ▼
+[FastAPI + Nginx (Docker on EC2)]
+   REST POST /api/check-interaction
+   WS   /ws/check-interaction  ◄── Real-time trace streaming
+        │
+        ▼
+[agent_service.py]
+   ├─ mode=flow → Bedrock Flow V4 (DoWhile)
+   └─ mode=pipeline (fallback) → Direct agent invocation
+        │
+        ▼
+[Amazon Bedrock Flow V4]
+   ┌────────────────────────────────────────────────────────┐
+   │  FlowInput                                             │
+   │     ↓                                                  │
+   │  PlannerAgent (Claude 3 Sonnet)                        │
+   │     ├─ identify_substances() Lambda                    │
+   │     ├─ check_curated_interaction() Lambda ──► Layer 0  │
+   │     │        (PostgreSQL hit → instant return)         │
+   │     └─ Cache miss → enter DoWhile loop                 │
+   │                                                        │
+   │  DoWhile Loop (max 3 iterations)                       │
+   │  ┌──────────────────────────────────────────────────┐  │
+   │  │  AYUSHAgent (Claude 3 Haiku)                     │  │
+   │  │     ├─ ayush_name_resolver() Lambda              │  │
+   │  │     ├─ imppat_lookup() Lambda (DynamoDB)         │  │
+   │  │     └─ search_cyp_interactions() Lambda (Tavily) │  │
+   │  │                    +                             │  │
+   │  │  AllopathyAgent (Claude 3 Haiku)                 │  │
+   │  │     ├─ allopathy_cache_lookup() Lambda (PG)      │  │
+   │  │     ├─ web_search() Lambda (Tavily)              │  │
+   │  │     ├─ check_nti_status() Lambda                 │  │
+   │  │     └─ allopathy_cache_save() Lambda (PG)        │  │
+   │  │                    ↓                             │  │
+   │  │  DataMergePrompt (Amazon Nova Pro)               │  │
+   │  │     └─ Consolidate AYUSH + Allopathy data        │  │
+   │  │                    ↓                             │  │
+   │  │  ReasoningAgent (Claude 3 Sonnet)                │  │
+   │  │     ├─ build_knowledge_graph() Lambda            │  │
+   │  │     ├─ web_search() Lambda (research articles)   │  │
+   │  │     ├─ calculate_severity() Lambda               │  │
+   │  │     └─ format_professional_response() Lambda     │  │
+   │  │                    ↓                             │  │
+   │  │  ValidationParser (inline code node)            │  │
+   │  │     └─ Extract validation_status from output     │  │
+   │  │                    ↓                             │  │
+   │  │  ValidationLoopController                        │  │
+   │  │     ├─ PASSED → Exit DoWhile                     │  │
+   │  │     └─ NEEDS_MORE_DATA → Re-run loop (max 3x)    │  │
+   │  └──────────────────────────────────────────────────┘  │
+   │                    ↓                                    │
+   │  FlowOutput                                             │
+   └────────────────────────────────────────────────────────┘
+        │
+        ▼
+[FastAPI: format + stream response]
+        │
+        ▼
+[Frontend: Cytoscape.js KG + Severity + Sources + Disclaimer]
 ```
 
-### Technology Stack
+---
 
-**AWS Services:**
-| Service | Purpose |
-|---------|---------|
-| **Amazon Bedrock Agents** | Multi-agent orchestration with Claude models |
-| **AWS Lambda** | Action group handlers (Python 3.12) |
-| **Amazon S3** | Static data storage (IMPPAT, curated DB) |
-| **Amazon DynamoDB** | Caching for allopathy data and knowledge graphs |
-| **Amazon API Gateway** | REST API for frontend |
-| **AWS Amplify** | React frontend hosting |
-| **AWS Secrets Manager** | API keys (Tavily) |
-| **AWS CloudFormation/SAM** | Infrastructure as code |
+## Component Details
 
-**Foundation Models:**
-| Model | Usage |
-|-------|-------|
-| **Claude 3 Sonnet** | Supervisor Agent, Reasoning Agent |
-| **Claude 3 Haiku** | AYUSH Agent, Allopathy Agent (cost-effective) |
+### Backend (FastAPI)
 
-**External Services:**
-| Service | Purpose |
-|---------|---------|
-| **Tavily API** | Web search for drug info and research |
+**File: `backend/app/main.py`**
+- REST endpoint `POST /api/check-interaction`: Synchronous interaction check
+- WebSocket endpoint `WS /ws/check-interaction`: Streams agent trace events to frontend
+- `GET /api/health`: Returns system status, agent IDs, Flow ID, DB config
+- `GET /api/interactions`: Lists recent 20 curated interactions from PostgreSQL
+- `GET /`: Serves React frontend static files
 
-### Data Flow Sequence
+**File: `backend/app/agent_service.py`**
+- Orchestrates Bedrock Flow V4 or Pipeline Mode execution
+- Parses Bedrock Flow trace events for WebSocket streaming
+- Handles Flow timeout → automatic Pipeline Mode fallback
+- Supports `mode="auto|flow|pipeline"` parameter
 
+**File: `backend/app/config.py`**
+- Environment-based configuration for 4 agent IDs and aliases, Flow ID
+- PostgreSQL connection string, input validation rules
+- Agent model mapping (Sonnet for Planner/Reasoning, Haiku for AYUSH/Allopathy)
+
+**File: `backend/app/db.py`**
+- PostgreSQL connection pool (psycopg2)
+- `lookup_curated(ayush_name, allopathy_name)` — Layer 0 instant response
+- `get_sources(interaction_key)` — Retrieve source URLs for curated interactions
+- `save_interaction(...)` — Persist new interaction results
+- `list_interactions()` — Returns 20 most recent interactions
+
+**File: `backend/app/models.py`**
+- Pydantic `InteractionRequest`: validates `ayush_medicine`, `allopathy_drug`, `user_type`
+- Pydantic `HealthResponse`: system status schema
+
+**Deployment:**
+- `Dockerfile`: Python 3.12-slim image
+- `docker-compose.yml`: FastAPI app + Nginx reverse proxy
+- `nginx.conf`: Reverse proxy config, static file serving
+
+---
+
+### Bedrock Agents
+
+| Agent | Model | Role | Action Groups |
+|-------|-------|------|---------------|
+| **Planner Agent** | Claude 3 Sonnet | Entry point; identify substances, check curated DB | `planner_tools` |
+| **AYUSH Agent** | Claude 3 Haiku | Gather plant phytochemical + CYP data | `ayush_data`, `web_search` |
+| **Allopathy Agent** | Claude 3 Haiku | Gather drug CYP/metabolism data via cache + web | `allopathy_data`, `web_search` |
+| **Reasoning Agent** | Claude 3 Sonnet | Build KG, score severity, validate, format response | `reasoning_tools`, `web_search` |
+
+---
+
+### Lambda Action Groups
+
+#### `planner_tools/handler.py`
+| Function | Input | Output |
+|----------|-------|--------|
+| `identify_substances` | Raw user text | `{ayush_medicine, allopathy_drug, confidence}` |
+| `check_curated_interaction` | ayush_name, allopathy_name | `{found: bool, response_data, knowledge_graph}` (uses `response_data` column) |
+
+#### `ayush_data/handler.py`
+| Function | Input | Output |
+|----------|-------|--------|
+| `ayush_name_resolver` | Common/brand name | `{scientific_name, common_names, key_phytochemicals}` |
+| `imppat_lookup` | scientific_name | `{phytochemicals[], admet_properties, cyp_effects}` from DynamoDB |
+| `search_cyp_interactions` | plant_name | `{cyp_interactions[], sources[]}` via Tavily |
+
+#### `allopathy_data/handler.py`
+| Function | Input | Output |
+|----------|-------|--------|
+| `allopathy_cache_lookup` | drug_name | `{found: bool, drug_data, sources[], cached_at}` |
+| `allopathy_cache_save` | drug_name, drug_data, sources | `{success: bool}` — 7-day TTL |
+| `check_nti_status` | drug_name | `{is_nti: bool, clinical_concern, primary_cyp_substrates}` |
+
+#### `web_search/handler.py`
+| Function | Input | Output |
+|----------|-------|--------|
+| `web_search` | query, max_results | `{results: [{url, title, snippet, category, score}]}` |
+
+Source categories: PubMed, DrugBank, FDA, research_paper, general
+
+#### `reasoning_tools/handler.py`
+| Function | Input | Output |
+|----------|-------|--------|
+| `build_knowledge_graph` | ayush_data, allopathy_data | `{nodes[], edges[], overlap_nodes[]}` |
+| `calculate_severity` | interactions_data, is_nti | `{severity: NONE/MINOR/MODERATE/MAJOR, score: 0-100, factors[]}` |
+| `format_professional_response` | all_data | Full structured JSON response |
+
+#### `validation_parser/handler.py`
+- Inline code node in Bedrock Flow
+- Extracts `validation_status: PASSED | NEEDS_MORE_DATA` from Reasoning Agent output
+- Controls DoWhile loop exit condition
+
+#### Supporting Lambda Functions
+- `imppat_loader/handler.py`: Loads IMPPAT phytochemical records to DynamoDB `ausadhi-imppat`
+- `check_curated_db/handler.py`: Legacy S3-based curated check (replaced by PostgreSQL version)
+- `shared/bedrock_utils.py`, `shared/db_utils.py`: Shared utilities
+
+---
+
+### Data Architecture
+
+#### PostgreSQL (RDS) — `aushadhimitra` database
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           REQUEST FLOW                                       │
-└─────────────────────────────────────────────────────────────────────────────┘
+curated_interactions
+  ├─ interaction_key       VARCHAR (PK, format: "ayush_name:allopathy_name")
+  ├─ ayush_name            VARCHAR
+  ├─ allopathy_name        VARCHAR
+  ├─ severity              VARCHAR (NONE/MINOR/MODERATE/MAJOR)
+  ├─ response_data         JSONB  ← NOTE: Lambda must use this column name
+  ├─ knowledge_graph       JSONB
+  └─ created_at            TIMESTAMP
 
-User: "Check turmeric with warfarin"
-              │
-              ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ STEP 1: API Gateway receives request                                         │
-│         POST /api/check-interaction                                          │
-│         Body: {"ayush": "turmeric", "allopathy": "warfarin", "user": "pro"} │
-└─────────────────────────────────────────────────────────────────────────────┘
-              │
-              ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ STEP 2: Supervisor Agent invoked                                             │
-│         - Parses input: AYUSH=Turmeric, Allopathy=Warfarin                  │
-│         - Invokes check_curated_db Lambda                                    │
-└─────────────────────────────────────────────────────────────────────────────┘
-              │
-              ├── CURATED HIT ──────────────────────────────────────┐
-              │                                                      │
-              │   ┌──────────────────────────────────────────────┐   │
-              │   │ Return pre-computed response in <500ms       │   │
-              │   │ - Pre-built knowledge graph                  │   │
-              │   │ - Severity: MAJOR                            │   │
-              │   │ - All summaries ready                        │   │
-              │   └──────────────────────────────────────────────┘   │
-              │                                                      │
-              ├── CURATED MISS ─────────────────────────────────────┘
-              │
-              ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ STEP 3: Supervisor routes to Collaborator Agents (PARALLEL)                  │
-└─────────────────────────────────────────────────────────────────────────────┘
-              │
-      ┌───────┴───────┐
-      ▼               ▼
-┌────────────┐  ┌────────────┐
-│AYUSH Agent │  │ALLOPATHY   │
-│            │  │AGENT       │
-│ Lambda:    │  │            │
-│ name_resolve│  │ Lambda:    │
-│ → Curcuma  │  │ cache_lookup│
-│   longa    │  │ → MISS     │
-│            │  │            │
-│ Lambda:    │  │ Lambda:    │
-│ imppat_load│  │ web_search │
-│ → S3 JSON  │  │ → Tavily   │
-│            │  │            │
-│ Result:    │  │ Lambda:    │
-│ CYP2C9 inh │  │ cache_save │
-│ CYP3A4 inh │  │            │
-│            │  │ Result:    │
-│completeness│  │ CYP2C9 sub │
-│: 0.9       │  │ NTI: true  │
-└─────┬──────┘  └─────┬──────┘
-      │               │
-      └───────┬───────┘
-              ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ STEP 4: Supervisor passes data to Reasoning Agent                            │
-└─────────────────────────────────────────────────────────────────────────────┘
-              │
-              ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ REASONING AGENT                                                              │
-│                                                                              │
-│ Lambda: build_knowledge_graph                                                │
-│ → Nodes: Turmeric, Curcumin, Warfarin, CYP2C9, CYP3A4                       │
-│ → Edges: CONTAINS, INHIBITS, METABOLIZED_BY                                 │
-│ → Overlap: CYP2C9 (marked red)                                              │
-│                                                                              │
-│ Lambda: web_search (research articles)                                       │
-│ → "Curcumin warfarin interaction PubMed"                                    │
-│ → Found 3 case reports                                                       │
-│                                                                              │
-│ Lambda: calculate_severity                                                   │
-│ → CYP2C9 overlap: +15 points                                                │
-│ → NTI drug: +25 points                                                       │
-│ → Case reports: +20 points                                                   │
-│ → Antiplatelet PD: +15 points                                               │
-│ → Total: 75 → MAJOR                                                          │
-│                                                                              │
-│ LLM: Generate grounded explanation                                           │
-└─────────────────────────────────────────────────────────────────────────────┘
-              │
-              ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ STEP 5: Supervisor receives result and formats based on user_type                       │
-│                                                                              │
-│ IF professional:                                                             │
-│   → Reasoning Agent already called format_professional_response Lambda      │
-│   → Return structured JSON with KG, severity, mechanisms, sources           │
-│                                                                              │
-│ IF patient:                                                                  │
-│   → Reasoning Agent generated simple 4-5 sentence response                  │
-│   → Return in detected language (English/Hindi/Hinglish)                    │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+interaction_sources
+  ├─ source_id             SERIAL (PK)
+  ├─ interaction_key       VARCHAR (FK → curated_interactions)
+  ├─ url                   TEXT
+  ├─ title                 TEXT
+  ├─ snippet               TEXT
+  └─ category              VARCHAR
 
-## Agent Configurations
-
-### Supervisor Agent
-
-```yaml
-Name: AushadhiMitra-Supervisor
-Model: anthropic.claude-3-sonnet-20240229-v1:0
-Description: Main orchestrator for drug interaction checking
-
-Instructions: |
-  You are the supervisor agent for AushadhiMitra, an AYUSH-Allopathy drug 
-  interaction checker. Your role is to:
-  
-  1. Parse user input to identify AYUSH medicines and allopathic drugs
-  2. First check the curated database for instant response
-  3. If not found, route to AYUSH and Allopathy collaborator agents
-  4. Pass gathered data to Reasoning agent for analysis
-  5. Format the final response based on user type (professional/patient)
-  
-  Always ensure responses are grounded in evidence. Never make up interactions.
-  Cite sources for all claims.
-
-Collaborators:
-  - AYUSH-Data-Agent
-  - Allopathy-Data-Agent
-  - Reasoning-Agent
-
-Action Groups:
-  - check_curated_db
+allopathy_cache
+  ├─ drug_name             VARCHAR (PK)
+  ├─ generic_name          VARCHAR
+  ├─ drug_data             JSONB
+  ├─ sources               JSONB
+  ├─ cached_at             TIMESTAMP
+  └─ expires_at            TIMESTAMP (TTL: 7 days)
 ```
 
-### AYUSH Collaborator Agent
+#### DynamoDB — `ausadhi-imppat` table
+```
+PK: plant_name (e.g., "curcuma_longa")
+SK: record_key ("METADATA" or "PHYTO#<imppat_id>")
 
-```yaml
-Name: AYUSH-Data-Agent
-Model: anthropic.claude-3-haiku-20240307-v1:0
-Description: Gathers phytochemical and ADMET data for AYUSH medicines
+METADATA record:
+  ├─ scientific_name, common_name, family
+  └─ phytochemical_count, last_updated
 
-Instructions: |
-  You are a specialized agent for gathering AYUSH medicine data.
-  
-  1. Use ayush_name_resolver to convert common names to scientific names
-  2. Use imppat_lookup to load phytochemical and ADMET data from S3
-  3. Check for CYP inhibitor status from the ADMET data
-  4. If CYP inducer data is missing, use web_search_tavily to find it
-  5. Report data_completeness score and list any gaps
-  
-  Your scope is 4 plants: Curcuma longa, Glycyrrhiza glabra, 
-  Zingiber officinale, Hypericum perforatum.
-
-Action Groups:
-  - ayush_name_resolver
-  - imppat_lookup
-  - web_search_tavily
+PHYTO#<id> record:
+  ├─ phytochemical_name, plant_part, imppat_id
+  ├─ smiles, molecular_weight, drug_likeness
+  ├─ admet_properties (dict)
+  └─ cyp_interactions (inhibits[], induces[], substrates[])
 ```
 
-### Allopathy Collaborator Agent
-
-```yaml
-Name: Allopathy-Data-Agent
-Model: anthropic.claude-3-haiku-20240307-v1:0
-Description: Gathers CYP metabolism data for allopathic drugs
-
-Instructions: |
-  You are a specialized agent for gathering allopathic drug data.
-  
-  1. Use cache_lookup to check if drug data is already cached
-  2. If cache hit and fresh (<7 days), use cached data
-  3. If cache miss, use web_search_tavily with query:
-     "{drug_name} DrugBank CYP metabolism substrate inhibitor"
-  4. Extract CYP substrate/inhibitor/inducer data from search results
-  5. Check if it's a Narrow Therapeutic Index drug
-  6. Use cache_save to store results for future queries
-  7. Report data_completeness score and list any gaps
-
-Action Groups:
-  - cache_lookup
-  - web_search_tavily
-  - cache_save
+#### S3 — `ausadhi-mitra-667736132441` bucket
+```
+/reference/name_mappings.json    — 5 AYUSH plants with scientific/common/Hindi/brand names
+/reference/cyp_enzymes.json      — 10 CYP450 enzymes with severity weights
+/reference/nti_drugs.json        — ~20 NTI drugs with clinical concerns
 ```
 
-### Reasoning Collaborator Agent
+---
 
-```yaml
-Name: Reasoning-Agent
-Model: anthropic.claude-3-sonnet-20240229-v1:0
-Description: Analyzes data, builds knowledge graph, calculates severity, formats output
-
-Instructions: |
-  You are a specialized reasoning agent that analyzes drug interaction data.
-  
-  1. Use build_knowledge_graph to construct JSON graph from provided data
-  2. Identify overlap nodes (enzymes affected by both medicines)
-  3. Use web_search_tavily to find research articles about the combination
-  4. Detect any conflicts between sources
-  5. Use calculate_severity to compute rule-based severity score
-  6. Generate grounded explanation citing ONLY the provided evidence
-  
-  FOR OUTPUT FORMATTING:
-  7. If user_type == "professional":
-       - Use format_professional_response Lambda to assemble structured JSON
-       - Pass: knowledge_graph, severity, ayush_data, allopathy_data, 
-              research_citations, and your generated ai_summary
-  8. If user_type == "patient":
-       - Generate a simple 4-5 sentence response directly
-       - Match the user's language (English/Hindi/Hinglish)
-       - Be empathetic, not alarming
-       - Include one actionable recommendation
-  
-  CRITICAL: Never make claims not supported by the evidence.
-  If sources conflict, report both viewpoints.
-  If data is insufficient, say "UNKNOWN - Limited data available"
-
-Action Groups:
-  - build_knowledge_graph
-  - calculate_severity
-  - web_search_tavily
-  - format_professional_response
-```
-
-## Lambda Action Groups
-
-### Lambda 1: check_curated_db
-
-```python
-# lambda/check_curated_db/handler.py
-import json
-import boto3
-
-s3 = boto3.client('s3')
-BUCKET = 'aushadhimitra-data'
-
-def handler(event, context):
-    """Check if drug pair exists in curated database"""
-    
-    # Parse Bedrock Agent event
-    agent = event.get('agent', {})
-    action_group = event.get('actionGroup', '')
-    api_path = event.get('apiPath', '')
-    parameters = event.get('parameters', [])
-    
-    # Extract parameters
-    ayush_name = next((p['value'] for p in parameters if p['name'] == 'ayush_name'), None)
-    allopathy_name = next((p['value'] for p in parameters if p['name'] == 'allopathy_name'), None)
-    
-    # Load curated database from S3
-    response = s3.get_object(Bucket=BUCKET, Key='curated/curated_interactions.json')
-    curated_db = json.loads(response['Body'].read())
-    
-    # Normalize names
-    ayush_normalized = ayush_name.lower().strip()
-    allopathy_normalized = allopathy_name.lower().strip()
-    
-    # Search for match
-    for interaction in curated_db['interactions']:
-        ayush_match = ayush_normalized in [n.lower() for n in interaction['ayush']['names']]
-        allopathy_match = allopathy_normalized in [n.lower() for n in interaction['allopathy']['names']]
-        
-        if ayush_match and allopathy_match:
-            return {
-                'messageVersion': '1.0',
-                'response': {
-                    'actionGroup': action_group,
-                    'apiPath': api_path,
-                    'httpMethod': 'GET',
-                    'httpStatusCode': 200,
-                    'responseBody': {
-                        'application/json': {
-                            'body': json.dumps({
-                                'found': True,
-                                'interaction': interaction
-                            })
-                        }
-                    }
-                }
-            }
-    
-    # Not found
-    return {
-        'messageVersion': '1.0',
-        'response': {
-            'actionGroup': action_group,
-            'apiPath': api_path,
-            'httpMethod': 'GET',
-            'httpStatusCode': 200,
-            'responseBody': {
-                'application/json': {
-                    'body': json.dumps({'found': False})
-                }
-            }
-        }
-    }
-```
-
-### Lambda 2: ayush_name_resolver
-
-```python
-# lambda/ayush_name_resolver/handler.py
-import json
-import boto3
-
-s3 = boto3.client('s3')
-BUCKET = 'aushadhimitra-data'
-
-def handler(event, context):
-    """Resolve common AYUSH name to scientific name"""
-    
-    parameters = event.get('parameters', [])
-    common_name = next((p['value'] for p in parameters if p['name'] == 'common_name'), None)
-    
-    # Load name mappings
-    response = s3.get_object(Bucket=BUCKET, Key='ayush/name_mappings.json')
-    mappings = json.loads(response['Body'].read())
-    
-    normalized = common_name.lower().strip()
-    
-    for plant in mappings['plants']:
-        all_names = [n.lower() for n in plant.get('common_names', [])]
-        all_names.extend([n.lower() for n in plant.get('hindi_names', [])])
-        all_names.extend([n.lower() for n in plant.get('brand_names', [])])
-        all_names.append(plant['scientific_name'].lower())
-        
-        if normalized in all_names:
-            return format_response(event, {
-                'found': True,
-                'scientific_name': plant['scientific_name'],
-                'common_name': plant['common_names'][0] if plant['common_names'] else common_name,
-                'imppat_file': plant.get('imppat_file')
-            })
-    
-    return format_response(event, {'found': False, 'input': common_name})
-
-def format_response(event, body):
-    return {
-        'messageVersion': '1.0',
-        'response': {
-            'actionGroup': event.get('actionGroup', ''),
-            'apiPath': event.get('apiPath', ''),
-            'httpMethod': 'GET',
-            'httpStatusCode': 200,
-            'responseBody': {
-                'application/json': {'body': json.dumps(body)}
-            }
-        }
-    }
-```
-
-### Lambda 3: build_knowledge_graph
-
-```python
-# lambda/build_knowledge_graph/handler.py
-import json
-
-NODE_COLORS = {
-    "plant": "#4CAF50",
-    "phytochemical": "#8BC34A",
-    "drug": "#2196F3",
-    "enzyme": "#FF9800",
-    "overlap": "#F44336"
-}
-
-def handler(event, context):
-    """Build JSON knowledge graph and identify overlaps"""
-    
-    parameters = event.get('parameters', [])
-    ayush_data = json.loads(next((p['value'] for p in parameters if p['name'] == 'ayush_data'), '{}'))
-    allopathy_data = json.loads(next((p['value'] for p in parameters if p['name'] == 'allopathy_data'), '{}'))
-    
-    nodes = []
-    edges = []
-    overlap_nodes = []
-    
-    # Add plant node
-    plant_id = f"plant_{ayush_data.get('scientific_name', 'unknown').replace(' ', '_').lower()}"
-    nodes.append({
-        'id': plant_id,
-        'type': 'plant',
-        'label': ayush_data.get('scientific_name', 'Unknown'),
-        'color': NODE_COLORS['plant'],
-        'is_overlap': False
-    })
-    
-    # Add drug node
-    drug_id = f"drug_{allopathy_data.get('generic_name', 'unknown').lower()}"
-    nodes.append({
-        'id': drug_id,
-        'type': 'drug',
-        'label': allopathy_data.get('generic_name', 'Unknown'),
-        'color': NODE_COLORS['drug'],
-        'is_overlap': False
-    })
-    
-    # Add CYP enzyme nodes
-    ayush_cyp_inhibits = set(k for k, v in ayush_data.get('cyp_inhibition', {}).items() if v)
-    ayush_cyp_induces = set(k for k, v in ayush_data.get('cyp_induction', {}).items() if v)
-    allopathy_substrates = set(k for k, v in allopathy_data.get('cyp_substrate', {}).items() if v)
-    
-    all_enzymes = ayush_cyp_inhibits | ayush_cyp_induces | allopathy_substrates
-    
-    for enzyme in all_enzymes:
-        enzyme_id = enzyme.lower()
-        is_overlap = (enzyme in ayush_cyp_inhibits or enzyme in ayush_cyp_induces) and enzyme in allopathy_substrates
-        
-        if is_overlap:
-            overlap_nodes.append(enzyme_id)
-        
-        nodes.append({
-            'id': enzyme_id,
-            'type': 'enzyme',
-            'label': enzyme.upper(),
-            'color': NODE_COLORS['overlap'] if is_overlap else NODE_COLORS['enzyme'],
-            'is_overlap': is_overlap
-        })
-        
-        # Add edges
-        if enzyme in ayush_cyp_inhibits:
-            edges.append({
-                'id': f"e_{plant_id}_{enzyme_id}_inhibits",
-                'source': plant_id,
-                'target': enzyme_id,
-                'relation': 'INHIBITS',
-                'is_interaction_path': is_overlap
-            })
-        
-        if enzyme in ayush_cyp_induces:
-            edges.append({
-                'id': f"e_{plant_id}_{enzyme_id}_induces",
-                'source': plant_id,
-                'target': enzyme_id,
-                'relation': 'INDUCES',
-                'is_interaction_path': is_overlap
-            })
-        
-        if enzyme in allopathy_substrates:
-            edges.append({
-                'id': f"e_{drug_id}_{enzyme_id}_metabolized",
-                'source': drug_id,
-                'target': enzyme_id,
-                'relation': 'METABOLIZED_BY',
-                'is_interaction_path': is_overlap
-            })
-    
-    graph = {
-        'nodes': nodes,
-        'edges': edges,
-        'metadata': {
-            'ayush_drug': ayush_data.get('scientific_name'),
-            'allopathy_drug': allopathy_data.get('generic_name'),
-            'overlap_nodes': overlap_nodes,
-            'interaction_detected': len(overlap_nodes) > 0
-        }
-    }
-    
-    return format_response(event, graph)
-```
-
-### Lambda 4: calculate_severity
-
-```python
-# lambda/calculate_severity/handler.py
-import json
-
-MAJOR_CYPS = ['cyp3a4', 'cyp2d6', 'cyp2c9']
-
-def handler(event, context):
-    """Rule-based severity calculation"""
-    
-    parameters = event.get('parameters', [])
-    overlap_nodes = json.loads(next((p['value'] for p in parameters if p['name'] == 'overlap_nodes'), '[]'))
-    nti_drug = next((p['value'] for p in parameters if p['name'] == 'nti_drug'), 'false') == 'true'
-    research_count = int(next((p['value'] for p in parameters if p['name'] == 'research_count'), '0'))
-    pd_overlap = next((p['value'] for p in parameters if p['name'] == 'pd_overlap'), 'false') == 'true'
-    
-    score = 0
-    factors = []
-    
-    # Factor 1: CYP Pathway Overlap (0-30 points)
-    for node in overlap_nodes:
-        if node.lower() in MAJOR_CYPS:
-            score += 15
-            factors.append(f"Overlap on {node.upper()} (major metabolic pathway)")
-        else:
-            score += 5
-            factors.append(f"Overlap on {node.upper()}")
-    
-    # Factor 2: Narrow Therapeutic Index (0-25 points)
-    if nti_drug:
-        score += 25
-        factors.append("Drug has Narrow Therapeutic Index - high risk")
-    
-    # Factor 3: Research Evidence (0-30 points)
-    if research_count >= 3:
-        score += 30
-        factors.append(f"Supported by {research_count} research articles")
-    elif research_count >= 1:
-        score += 20
-        factors.append(f"Supported by {research_count} research article(s)")
-    
-    # Factor 4: Pharmacodynamic Overlap (0-15 points)
-    if pd_overlap:
-        score += 15
-        factors.append("Additive pharmacodynamic effects")
-    
-    # Severity Classification
-    if score >= 60:
-        severity = "MAJOR"
-        recommendation = "AVOID combination. Consult healthcare provider immediately."
-    elif score >= 35:
-        severity = "MODERATE"
-        recommendation = "Use with caution. Monitor closely for adverse effects."
-    elif score >= 15:
-        severity = "MINOR"
-        recommendation = "Generally safe. Be aware of potential effects."
-    else:
-        severity = "NONE"
-        recommendation = "No significant interaction expected."
-    
-    result = {
-        'severity': severity,
-        'score': score,
-        'factors': factors,
-        'recommendation': recommendation
-    }
-    
-    return format_response(event, result)
-```
-
-### Lambda 5: format_professional_response
-
-```python
-# lambda/format_professional_response/handler.py
-import json
-from datetime import datetime
-
-def handler(event, context):
-    """Assemble structured JSON response for professional UI"""
-    
-    parameters = event.get('parameters', [])
-    
-    # Extract all data passed from Reasoning Agent
-    knowledge_graph = json.loads(get_param(parameters, 'knowledge_graph', '{}'))
-    severity = json.loads(get_param(parameters, 'severity', '{}'))
-    ayush_data = json.loads(get_param(parameters, 'ayush_data', '{}'))
-    allopathy_data = json.loads(get_param(parameters, 'allopathy_data', '{}'))
-    research_citations = json.loads(get_param(parameters, 'research_citations', '[]'))
-    ai_summary = get_param(parameters, 'ai_summary', '')
-    conflicts = json.loads(get_param(parameters, 'conflicts', 'null'))
-    
-    # Build professional response structure
-    response = {
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "query": {
-            "ayush_input": ayush_data.get('common_name', ''),
-            "allopathy_input": allopathy_data.get('generic_name', ''),
-            "resolved_ayush": ayush_data.get('scientific_name', ''),
-            "resolved_allopathy": allopathy_data.get('generic_name', '')
-        },
-        "severity": {
-            "level": severity.get('severity', 'UNKNOWN'),
-            "score": severity.get('score', 0),
-            "factors": severity.get('factors', []),
-            "recommendation": severity.get('recommendation', '')
-        },
-        "knowledge_graph": knowledge_graph,
-        "mechanisms": extract_mechanisms(knowledge_graph, ayush_data, allopathy_data),
-        "ayush_profile": {
-            "name": ayush_data.get('scientific_name', ''),
-            "common_names": ayush_data.get('common_names', []),
-            "cyp_inhibition": ayush_data.get('cyp_inhibition', {}),
-            "cyp_induction": ayush_data.get('cyp_induction', {}),
-            "effect_categories": ayush_data.get('effect_categories', []),
-            "data_completeness": ayush_data.get('data_completeness', 0),
-            "sources": ayush_data.get('sources', [])
-        },
-        "allopathy_profile": {
-            "name": allopathy_data.get('generic_name', ''),
-            "drug_class": allopathy_data.get('drug_class', ''),
-            "cyp_substrate": allopathy_data.get('cyp_substrate', {}),
-            "narrow_therapeutic_index": allopathy_data.get('narrow_therapeutic_index', False),
-            "effect_categories": allopathy_data.get('effect_categories', []),
-            "data_completeness": allopathy_data.get('data_completeness', 0),
-            "sources": allopathy_data.get('sources', [])
-        },
-        "research_citations": research_citations,
-        "conflicts": conflicts,
-        "ai_summary": ai_summary,
-        "disclaimer": "This information is for educational purposes only. Always consult a healthcare provider before making medication changes."
-    }
-    
-    return format_response(event, response)
-
-def get_param(parameters, name, default=''):
-    """Safely extract parameter value"""
-    return next((p['value'] for p in parameters if p['name'] == name), default)
-
-def extract_mechanisms(kg, ayush_data, allopathy_data):
-    """Extract interaction mechanisms from knowledge graph"""
-    mechanisms = []
-    
-    overlap_nodes = kg.get('metadata', {}).get('overlap_nodes', [])
-    
-    for node_id in overlap_nodes:
-        # Find edges connected to this overlap node
-        inhibits_edge = None
-        substrate_edge = None
-        
-        for edge in kg.get('edges', []):
-            if edge.get('target') == node_id:
-                if edge.get('relation') == 'INHIBITS':
-                    inhibits_edge = edge
-                elif edge.get('relation') == 'INDUCES':
-                    inhibits_edge = edge  # treat induces similarly
-                elif edge.get('relation') == 'METABOLIZED_BY':
-                    substrate_edge = edge
-        
-        if inhibits_edge and substrate_edge:
-            enzyme_name = node_id.upper()
-            mechanism = {
-                "type": "pharmacokinetic_cyp",
-                "pathway": enzyme_name,
-                "direction": "inhibition" if inhibits_edge.get('relation') == 'INHIBITS' else "induction",
-                "description": f"{ayush_data.get('scientific_name', 'AYUSH medicine')} affects {enzyme_name}, which metabolizes {allopathy_data.get('generic_name', 'the drug')}.",
-                "clinical_significance": "May alter drug blood levels"
-            }
-            mechanisms.append(mechanism)
-    
-    # Check for pharmacodynamic overlap
-    ayush_effects = set(ayush_data.get('effect_categories', []))
-    allo_effects = set(allopathy_data.get('effect_categories', []))
-    pd_overlap = ayush_effects & allo_effects
-    
-    for effect in pd_overlap:
-        mechanisms.append({
-            "type": "pharmacodynamic",
-            "pathway": effect,
-            "direction": "additive",
-            "description": f"Both medicines have {effect} effects",
-            "clinical_significance": "Additive effect may increase risk"
-        })
-    
-    return mechanisms
-
-def format_response(event, body):
-    return {
-        'messageVersion': '1.0',
-        'response': {
-            'actionGroup': event.get('actionGroup', ''),
-            'apiPath': event.get('apiPath', ''),
-            'httpMethod': 'POST',
-            'httpStatusCode': 200,
-            'responseBody': {
-                'application/json': {'body': json.dumps(body)}
-            }
-        }
-    }
-```
-
-## Data Schemas
-
-### S3: Curated Interactions (curated_interactions.json)
+### Knowledge Graph Schema
 
 ```json
 {
-  "version": "1.0",
-  "last_updated": "2026-02-25",
-  "interactions": [
-    {
-      "id": "TURMERIC_WARFARIN",
-      "ayush": {
-        "names": ["turmeric", "haldi", "curcuma longa", "curcumin"],
-        "scientific_name": "Curcuma longa"
-      },
-      "allopathy": {
-        "names": ["warfarin", "coumadin", "jantoven"],
-        "generic_name": "Warfarin",
-        "narrow_therapeutic_index": true
-      },
-      "severity": "MAJOR",
-      "severity_score": 72,
-      "severity_factors": [
-        "Overlap on CYP2C9 (major metabolic pathway)",
-        "Drug has Narrow Therapeutic Index",
-        "Supported by 3 case reports",
-        "Additive antiplatelet effects"
-      ],
-      "mechanisms": [
-        {
-          "type": "pharmacokinetic_cyp",
-          "pathway": "CYP2C9",
-          "description": "Curcumin inhibits CYP2C9, which metabolizes 85% of Warfarin"
-        }
-      ],
-      "clinical_effects": ["Increased bleeding risk", "Elevated INR"],
-      "knowledge_graph": {
-        "nodes": [...],
-        "edges": [...],
-        "metadata": {"overlap_nodes": ["cyp2c9"]}
-      },
-      "research_citations": [
-        {
-          "title": "Curcumin-warfarin interaction",
-          "pmid": "12345678",
-          "url": "https://pubmed.ncbi.nlm.nih.gov/12345678/"
-        }
-      ],
-      "professional_summary": "Technical summary...",
-      "patient_summary_en": "Simple English...",
-      "patient_summary_hi": "हिंदी में...",
-      "patient_summary_hinglish": "Hinglish mein..."
-    }
+  "nodes": [
+    {"id": "plant_1", "label": "Turmeric", "type": "Plant"},
+    {"id": "phyto_1", "label": "Curcumin", "type": "Phytochemical"},
+    {"id": "drug_1",  "label": "Warfarin",  "type": "Drug"},
+    {"id": "cyp_1",   "label": "CYP2C9",    "type": "CYP_Enzyme", "is_overlap": true},
+    {"id": "cyp_2",   "label": "CYP3A4",    "type": "CYP_Enzyme"}
+  ],
+  "edges": [
+    {"source": "plant_1",  "target": "phyto_1", "relationship": "CONTAINS"},
+    {"source": "phyto_1",  "target": "cyp_1",   "relationship": "INHIBITS"},
+    {"source": "drug_1",   "target": "cyp_1",   "relationship": "METABOLIZED_BY"}
+  ],
+  "overlap_nodes": ["cyp_1"],
+  "interaction_points": [
+    {"enzyme": "CYP2C9", "effect": "Curcumin inhibits; Warfarin substrate → increased Warfarin levels"}
   ]
 }
 ```
 
-### DynamoDB: Allopathy Cache
+---
+
+### Severity Scoring Algorithm
 
 ```
-Table: allopathy_cache
-Primary Key: drug_name (String)
-TTL: ttl (Number - epoch seconds)
+Base score: 0
 
++ 15 points × (number of shared CYP enzymes)
++ 25 points   (if allopathic drug is NTI)
++ 20 points   (if clinical evidence: case report or study found)
++ 15 points   (if pharmacodynamic overlap: shared effect category)
+
+Score → Severity:
+  0–20  → NONE
+  21–40 → MINOR
+  41–60 → MODERATE
+  61+   → MAJOR
+```
+
+**Example (Turmeric + Warfarin):**
+- CYP2C9 overlap: +15
+- NTI (Warfarin): +25
+- Anticoagulant PD overlap: +15
+- Case report evidence: +20
+- Total: 75 → **MAJOR**
+
+---
+
+### WebSocket Streaming Protocol
+
+```
+Client connects: WS /ws/check-interaction
+Client sends: {"ayush_medicine": "turmeric", "allopathy_drug": "warfarin", "user_type": "professional"}
+
+Server streams events:
+  {"type": "status",         "message": "Starting interaction check..."}
+  {"type": "trace",          "message": "PlannerAgent: Identifying substances", "data": {...}}
+  {"type": "trace",          "message": "AYUSHAgent: Looking up IMPPAT data", "data": {...}}
+  {"type": "trace",          "message": "AllopathyAgent: Web search in progress", "data": {...}}
+  {"type": "agent_complete", "message": "ReasoningAgent: Analysis complete"}
+  {"type": "validation",     "message": "Validation: PASSED", "loop_iterations": 1}
+  {"type": "response_chunk", "message": "...response text chunk..."}
+  {"type": "complete",       "full_response": {...}, "execution_mode": "flow", "loop_iterations": 1, "final_validation": "PASSED"}
+```
+
+---
+
+### Professional Response Structure
+
+```json
 {
-  "drug_name": "warfarin",
-  "generic_name": "Warfarin",
-  "brand_names": ["Coumadin", "Jantoven"],
-  "drug_class": "Anticoagulant",
-  "cyp_substrate": {"CYP2C9": true, "CYP3A4": true},
-  "cyp_inhibitor": {},
-  "cyp_inducer": {},
-  "narrow_therapeutic_index": true,
-  "effect_categories": ["blood_thinning"],
-  "sources": [...],
-  "cached_at": "2026-02-25T10:00:00Z",
-  "ttl": 1740700800
+  "query": {"ayush_medicine": "...", "allopathy_drug": "..."},
+  "severity": {
+    "level": "MAJOR",
+    "score": 75,
+    "contributing_factors": ["CYP2C9 overlap", "NTI drug", "Anticoagulant PD overlap", "Case report evidence"]
+  },
+  "knowledge_graph": { "nodes": [...], "edges": [...], "overlap_nodes": [...] },
+  "mechanisms": [
+    {"type": "CYP", "enzyme": "CYP2C9", "effect": "Curcumin inhibits CYP2C9; Warfarin is CYP2C9 substrate → elevated Warfarin levels → bleeding risk"}
+  ],
+  "ayush_profile": {
+    "plant": "Curcuma longa",
+    "phytochemicals": ["Curcumin", "Demethoxycurcumin"],
+    "cyp_effects": ["CYP2C9 inhibitor", "CYP3A4 inhibitor"],
+    "sources": [{"url": "...", "title": "IMPPAT entry", "category": "database"}]
+  },
+  "allopathy_profile": {
+    "drug": "Warfarin",
+    "generic_name": "Warfarin sodium",
+    "is_nti": true,
+    "cyp_substrate": ["CYP2C9"],
+    "sources": [{"url": "...", "title": "DrugBank: Warfarin", "category": "DrugBank"}]
+  },
+  "research_citations": [
+    {"url": "https://pubmed.ncbi.nlm.nih.gov/...", "title": "Curcumin-warfarin interaction...", "category": "PubMed"}
+  ],
+  "conflicts": [],
+  "ai_summary": "Turmeric (Curcumin) significantly inhibits CYP2C9, the primary enzyme metabolizing Warfarin...",
+  "disclaimer": "This tool provides informational analysis only. Consult a licensed healthcare professional before making any medication decisions.",
+  "execution_mode": "flow",
+  "loop_iterations": 1
 }
 ```
 
-## Deployment
+---
 
-### SAM Template (template.yaml)
+### Pipeline Fallback Mode
 
-```yaml
-AWSTemplateFormatVersion: '2010-09-09'
-Transform: AWS::Serverless-2016-10-31
-Description: AushadhiMitra - AYUSH-Allopathy Drug Interaction Checker
+When Bedrock Flow V4 times out (known issue), `agent_service.py` falls back to Pipeline Mode:
 
-Parameters:
-  TavilyApiKey:
-    Type: String
-    NoEcho: true
-
-Resources:
-  # S3 Bucket for static data
-  DataBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: aushadhimitra-data
-      
-  # DynamoDB Tables
-  AllopathyCacheTable:
-    Type: AWS::DynamoDB::Table
-    Properties:
-      TableName: allopathy_cache
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
-        - AttributeName: drug_name
-          AttributeType: S
-      KeySchema:
-        - AttributeName: drug_name
-          KeyType: HASH
-      TimeToLiveSpecification:
-        AttributeName: ttl
-        Enabled: true
-  
-  # Lambda Functions
-  CheckCuratedDbFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: aushadhimitra-check-curated-db
-      Runtime: python3.12
-      Handler: handler.handler
-      CodeUri: lambda/check_curated_db/
-      Timeout: 30
-      MemorySize: 256
-      Policies:
-        - S3ReadPolicy:
-            BucketName: !Ref DataBucket
-            
-  AyushNameResolverFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: aushadhimitra-ayush-name-resolver
-      Runtime: python3.12
-      Handler: handler.handler
-      CodeUri: lambda/ayush_name_resolver/
-      Timeout: 30
-      Policies:
-        - S3ReadPolicy:
-            BucketName: !Ref DataBucket
-            
-  WebSearchTavilyFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: aushadhimitra-web-search-tavily
-      Runtime: python3.12
-      Handler: handler.handler
-      CodeUri: lambda/web_search_tavily/
-      Timeout: 60
-      Environment:
-        Variables:
-          TAVILY_API_KEY: !Ref TavilyApiKey
-
-  BuildKnowledgeGraphFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: aushadhimitra-build-knowledge-graph
-      Runtime: python3.12
-      Handler: handler.handler
-      CodeUri: lambda/build_knowledge_graph/
-      Timeout: 30
-
-  CalculateSeverityFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: aushadhimitra-calculate-severity
-      Runtime: python3.12
-      Handler: handler.handler
-      CodeUri: lambda/calculate_severity/
-      Timeout: 30
-
-  FormatProfessionalResponseFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: aushadhimitra-format-professional-response
-      Runtime: python3.12
-      Handler: handler.handler
-      CodeUri: lambda/format_professional_response/
-      Timeout: 30
-      MemorySize: 256
-
-  # API Gateway
-  ApiGateway:
-    Type: AWS::Serverless::Api
-    Properties:
-      StageName: prod
-      Cors:
-        AllowOrigin: "'*'"
-        AllowMethods: "'POST, GET, OPTIONS'"
-        AllowHeaders: "'Content-Type'"
+```
+FastAPI agent_service.py (Pipeline Mode)
+  ↓
+invoke_agent(planner_agent_id, query)
+  ↓
+invoke_agent(ayush_agent_id, substances)       ─┐ parallel
+invoke_agent(allopathy_agent_id, substances)   ─┘
+  ↓
+invoke_agent(reasoning_agent_id, merged_data)
+  ↓
+Return formatted response
 ```
 
-## Frontend
+---
 
-### React with Cytoscape.js (Professional UI)
+## Deployment Architecture
 
-```javascript
-// src/components/KnowledgeGraphViewer.jsx
-import React from 'react';
-import CytoscapeComponent from 'react-cytoscapejs';
+```
+AWS Account: 667736132441  |  Region: us-east-1
 
-const KnowledgeGraphViewer = ({ graph }) => {
-  const elements = [
-    ...graph.nodes.map(node => ({
-      data: { id: node.id, label: node.label },
-      style: {
-        'background-color': node.is_overlap ? '#F44336' : node.color,
-        'width': node.is_overlap ? 60 : 40,
-        'height': node.is_overlap ? 60 : 40,
-        'label': 'data(label)',
-        'font-size': '10px',
-        'text-valign': 'bottom',
-        'text-margin-y': 5
-      }
-    })),
-    ...graph.edges.map(edge => ({
-      data: { 
-        id: edge.id, 
-        source: edge.source, 
-        target: edge.target,
-        label: edge.relation 
-      },
-      style: {
-        'line-color': edge.is_interaction_path ? '#F44336' : '#9E9E9E',
-        'width': edge.is_interaction_path ? 4 : 2,
-        'target-arrow-color': edge.is_interaction_path ? '#F44336' : '#9E9E9E',
-        'target-arrow-shape': 'triangle',
-        'curve-style': 'bezier',
-        'label': 'data(label)',
-        'font-size': '8px',
-        'text-rotation': 'autorotate'
-      }
-    }))
-  ];
+EC2 Instance
+  └─ Docker Compose
+       ├─ aushadhimitra-app (FastAPI, port 8000)
+       └─ aushadhimitra-nginx (Nginx, port 80/443)
 
-  return (
-    <div className="kg-container" style={{ height: '400px', border: '1px solid #ddd' }}>
-      <CytoscapeComponent
-        elements={elements}
-        style={{ width: '100%', height: '100%' }}
-        layout={{ name: 'cose', animate: true }}
-        cy={(cy) => {
-          cy.on('tap', 'node', (evt) => {
-            const node = evt.target;
-            console.log('Node clicked:', node.data());
-          });
-        }}
-      />
-    </div>
-  );
-};
-
-export default KnowledgeGraphViewer;
+AWS Services:
+  ├─ Bedrock Agents (4 agents: Planner, AYUSH, Allopathy, Reasoning)
+  ├─ Bedrock Flows (Flow V4 with DoWhile)
+  ├─ Lambda (12 functions, Python 3.12, us-east-1)
+  ├─ S3 Bucket: ausadhi-mitra-667736132441
+  ├─ DynamoDB: ausadhi-imppat
+  ├─ RDS PostgreSQL: scm-postgres.c2na6oc62pb7.us-east-1.rds.amazonaws.com:5432/aushadhimitra
+  └─ Secrets Manager: Tavily API key
 ```
 
-## Demo Scenarios
+### Deployment Scripts
+| Script | Purpose |
+|--------|---------|
+| `scripts/create_flow_v4.py` | Build Bedrock Flow V4 with DoWhile node |
+| `scripts/setup_agents.py` | Create/update 4 Bedrock agents with action groups |
+| `scripts/deploy_lambdas.sh` | Package and deploy Lambda functions |
+| `scripts/imppat_pipeline.py` | Load IMPPAT CSV data to DynamoDB |
+| `scripts/plant_details_extractor.py` | Extract IMPPAT plant metadata |
+| `scripts/plant_specific_extractor.py` | Deep extract phytochemical data per plant |
 
-| Priority | AYUSH | Allopathic | Expected | Notes |
-|----------|-------|------------|----------|-------|
-| 1 | Turmeric | Warfarin | MAJOR (curated) | Instant response |
-| 2 | St. John's Wort | Cyclosporine | MAJOR (curated) | Dramatic impact |
-| 3 | Ginger | Metformin | MODERATE (curated) | Shows moderate |
-| 4 | Ashwagandha | Sertraline | Real-time | Shows agent flow |
+---
 
-## Cost Estimate (Hackathon)
+## Known Issues and Mitigations
 
-| Service | Usage | Estimated Cost |
-|---------|-------|----------------|
-| Bedrock Agents | ~100 invocations | ~$5 |
-| Claude 3 Sonnet | ~50K tokens | ~$2 |
-| Claude 3 Haiku | ~100K tokens | ~$1 |
-| Lambda | ~500 invocations | ~$0.10 |
-| S3 | <1GB | ~$0.02 |
-| DynamoDB | On-demand | ~$0.50 |
-| **Total** | | **~$10** |
+| # | Issue | Impact | Mitigation |
+|---|-------|--------|-----------|
+| 1 | Bedrock Flow V4 timeout (Read timed out) | Flow execution fails | Auto-fallback to Pipeline Mode in `agent_service.py` |
+| 2 | Curated DB Lambda uses `interaction_data` column but DB has `response_data` | Layer 0 instant responses always fail; every query triggers full analysis | Fix Lambda to use `response_data` column |
+| 3 | `calculate_severity()` NoneType error when `interactions_data` is None | Severity Lambda crashes on null input | Add null guard: `if not interactions_data: return default_result` |
+| 4 | `db.py` backend vs Lambda schema alignment | Potential column name drift | Consolidate schema constants in `shared/db_utils.py` |
+| 5 | Empty `knowledge_graph` in some final responses | KG visualization fails silently | Ensure `build_knowledge_graph()` always returns a valid graph structure |
+
+---
+
+## Data Flow: Example Query
+
+**Input:** "Check interaction between turmeric and warfarin" (user_type: professional)
+
+```
+1. FastAPI validates request (Pydantic)
+2. agent_service.py → attempt Bedrock Flow V4
+3. PlannerAgent:
+   - identify_substances() → {ayush: "Curcuma longa", allopathy: "Warfarin"}
+   - check_curated_interaction() → {found: false} [Issue #2: may fail]
+4. DoWhile Iteration 1:
+   a. AYUSHAgent:
+      - ayush_name_resolver("turmeric") → scientific_name: "Curcuma longa"
+      - imppat_lookup("Curcuma longa") → {Curcumin: CYP2C9/3A4 inhibitor, Demethoxycurcumin: ...}
+      - search_cyp_interactions("Curcuma longa") → Tavily results with PubMed links
+   b. AllopathyAgent:
+      - allopathy_cache_lookup("Warfarin") → {found: false} (first run)
+      - web_search("Warfarin CYP metabolism DrugBank") → {CYP2C9 substrate, NTI drug}
+      - check_nti_status("Warfarin") → {is_nti: true, clinical_concern: "Bleeding risk"}
+      - allopathy_cache_save("Warfarin", data) → cached for 7 days
+   c. DataMergePrompt (Nova Pro) → consolidated data object
+   d. ReasoningAgent:
+      - build_knowledge_graph() → {nodes: [Turmeric, Curcumin, Warfarin, CYP2C9], edges: [...], overlap: [CYP2C9]}
+      - web_search("Curcumin warfarin interaction PubMed") → research citations
+      - calculate_severity() → {score: 75, level: MAJOR, factors: [CYP2C9, NTI, PD, evidence]}
+      - format_professional_response() → full JSON
+      - validation_status: PASSED
+   e. ValidationParser → extract "PASSED"
+   f. Loop exits
+5. FlowOutput → FastAPI formats and streams response
+6. WebSocket: streams trace events → "complete" event with full_response JSON
+7. Frontend: renders Cytoscape.js graph + severity badge + source URLs + disclaimer
+```

@@ -45,7 +45,9 @@ PLAN.md
 
 # Docker
 docker-compose.override.yml
-
+CLAUDE.md
+error.md
+.claude/
 # Logs
 *.log
 
