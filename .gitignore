@@ -53,7 +53,6 @@ scripts/state.json
 
 # Environment / secrets
 .env
-.env.*
 *.pem
 *.key
 
