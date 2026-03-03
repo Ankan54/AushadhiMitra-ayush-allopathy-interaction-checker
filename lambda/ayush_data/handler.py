@@ -111,12 +111,19 @@ def ayush_name_resolver(plant_name: str) -> dict:
         if query in all_names or any(query in n for n in all_names):
             pk = _scientific_to_pk(plant["scientific_name"])
             meta = _get_metadata(pk)
+            sci = plant["scientific_name"]
+            from urllib.parse import quote as _quote
+            imppat_url = (
+                plant.get("imppat_url")
+                or f"https://cb.imsc.res.in/imppat/phytochemical/{_quote(sci)}"
+            )
             return {
                 "resolved": True,
-                "scientific_name": plant["scientific_name"],
+                "scientific_name": sci,
                 "common_names": plant.get("common_names", []),
                 "hindi_names": plant.get("hindi_names", []),
                 "dynamodb_key": pk,
+                "imppat_url": imppat_url,
                 "total_phytochemicals": meta.get("total_phytochemicals", 0) if meta else 0,
                 "key_phytochemicals": plant.get("key_phytochemicals", []),
                 "known_cyp_effects": plant.get("known_cyp_effects", {}),

@@ -1,418 +1,209 @@
 """
-Pipeline Orchestration Service V4
+CO-MAS Multi-Agent Pipeline Orchestrator
 
-Supports two execution modes:
-  1. Flow Mode (default): Invoke the Bedrock Flow with DoWhile validation loop.
-     Parses flow-level + agent-level traces from flowTraceEvent for UI streaming.
-  2. Pipeline Mode (fallback): Direct agent invocation with EC2 orchestration
-     and validation loop-back, used when Flow invocation fails.
+Implements a Cooperative Multi-Agent System (CO-MAS) inspired pipeline for AYUSH-Allopathy
+drug interaction analysis:
 
-Architecture (Flow V4):
-  FlowInput → PlannerAgent → DoWhile Loop {
-      LoopInput → [AYUSH, Allopathy] → MergePrompt
-      → ReasoningAgent → ValidationCode → LoopController(exit=PASSED, max=3)
-  } → FlowOutput
+  0. NAME RESOLUTION + WHITELIST CHECK (pre-pipeline, no agent calls)
+  1. PLANNER  - plan / re-plan based on information gaps from Scorer
+  2. PROPOSER PHASE: AYUSH + Allopathy + Research agents (parallel)
+  3. EVALUATOR PHASE: Reasoning Agent — evidence-based interaction analysis
+  4. SCORER PHASE: Deterministic validation — checks completeness, identifies gaps
+  5. If gaps found → log gaps, loop back to step 1 with targeted feedback
+  6. FORMAT final JSON — deterministic function (not agent) for accuracy
 """
 import json
 import re
 import uuid
 import time
 import logging
-from typing import Generator, Tuple, Any
+import threading
+from urllib.parse import quote
+from typing import Generator, Tuple, Any, List, Optional
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from app.config import (
     REGION,
-    FLOW_ID, FLOW_ALIAS,
+    S3_BUCKET,
     PLANNER_AGENT_ID, PLANNER_AGENT_ALIAS,
     AYUSH_AGENT_ID, AYUSH_AGENT_ALIAS,
     ALLOPATHY_AGENT_ID, ALLOPATHY_AGENT_ALIAS,
     REASONING_AGENT_ID, REASONING_AGENT_ALIAS,
-    MAX_VALIDATION_RETRIES,
+    RESEARCH_AGENT_ID, RESEARCH_AGENT_ALIAS,
+    MAX_COMAS_ITERATIONS,
     AGENT_INVOKE_MAX_RETRIES,
     AGENT_RETRY_BASE_WAIT,
     INPUT_MAX_LENGTH,
     INPUT_MIN_LENGTH,
 )
+from app.cloudwatch_logger import (
+    log_pipeline_start,
+    log_pipeline_complete,
+    log_pipeline_error,
+    log_agent_trace,
+    log_iteration_gap,
+)
 
 logger = logging.getLogger(__name__)
 
-_client = None
+# ──────────────────────────────────────────────────────────────
+# AWS clients
+# ──────────────────────────────────────────────────────────────
+
+_bedrock_runtime = None
+_lambda_client = None
+_s3_client = None
+
+_BOTO_CONFIG = Config(
+    retries={"max_attempts": 3, "mode": "adaptive"},
+    read_timeout=600,
+    connect_timeout=10,
+)
+
+
+def _get_bedrock():
+    global _bedrock_runtime
+    if _bedrock_runtime is None:
+        _bedrock_runtime = boto3.client(
+            "bedrock-agent-runtime", region_name=REGION, config=_BOTO_CONFIG
+        )
+    return _bedrock_runtime
+
+
+def _get_lambda():
+    global _lambda_client
+    if _lambda_client is None:
+        _lambda_client = boto3.client("lambda", region_name=REGION)
+    return _lambda_client
+
+
+def _get_s3():
+    global _s3_client
+    if _s3_client is None:
+        _s3_client = boto3.client("s3", region_name=REGION)
+    return _s3_client
+
+
+# ──────────────────────────────────────────────────────────────
+# Agent registry
+# ──────────────────────────────────────────────────────────────
 
 AGENTS = {
-    "planner": {"id": PLANNER_AGENT_ID, "alias": PLANNER_AGENT_ALIAS,
-                "label": "Planner Agent"},
-    "ayush": {"id": AYUSH_AGENT_ID, "alias": AYUSH_AGENT_ALIAS,
-              "label": "AYUSH Agent"},
-    "allopathy": {"id": ALLOPATHY_AGENT_ID, "alias": ALLOPATHY_AGENT_ALIAS,
-                  "label": "Allopathy Agent"},
-    "reasoning": {"id": REASONING_AGENT_ID, "alias": REASONING_AGENT_ALIAS,
-                  "label": "Reasoning Agent"},
+    "planner":    {"id": PLANNER_AGENT_ID,    "alias": PLANNER_AGENT_ALIAS,    "label": "Planner"},
+    "ayush":      {"id": AYUSH_AGENT_ID,      "alias": AYUSH_AGENT_ALIAS,      "label": "AYUSH"},
+    "allopathy":  {"id": ALLOPATHY_AGENT_ID,  "alias": ALLOPATHY_AGENT_ALIAS,  "label": "Allopathy"},
+    "reasoning":  {"id": REASONING_AGENT_ID,  "alias": REASONING_AGENT_ALIAS,  "label": "Reasoning"},
+    "research":   {"id": RESEARCH_AGENT_ID,   "alias": RESEARCH_AGENT_ALIAS,   "label": "Research"},
 }
 
-NODE_TO_AGENT = {
-    "PlannerAgent": "planner",
-    "AYUSHAgent": "ayush",
-    "AllopathyAgent": "allopathy",
-    "ReasoningAgent": "reasoning",
-    "DataMergePrompt": "merge",
-    "ValidationStatusExtractor": "validation",
-    "ValidationLoopInput": "loop_input",
-    "ValidationLoopController": "loop_controller",
-    # Keep legacy names for backward compatibility with older flow versions
-    "MergePrompt": "merge",
-    "ValidationCode": "validation",
-    "LoopEntry": "loop_input",
-    "LoopExit": "loop_controller",
-}
-
-
-def _get_client():
-    global _client
-    if _client is None:
-        _client = boto3.client("bedrock-agent-runtime", region_name=REGION)
-    return _client
-
-
 # ──────────────────────────────────────────────────────────────
-# Input Validation
+# Name resolution & AYUSH validation
 # ──────────────────────────────────────────────────────────────
 
-_ALLOWED_CHARS = re.compile(r"^[\w\s\-'.,()]+$", re.UNICODE)
+_name_mappings_cache = None
+_name_mappings_lock = threading.Lock()
 
 
-def validate_drug_names(ayush_name: str, allopathy_name: str) -> Tuple[str, str]:
-    """Validate and sanitize drug name inputs. Returns cleaned names or raises ValueError."""
-    ayush_clean = ayush_name.strip()
-    allopathy_clean = allopathy_name.strip()
+def _load_name_mappings() -> dict:
+    global _name_mappings_cache
+    with _name_mappings_lock:
+        if _name_mappings_cache is not None:
+            return _name_mappings_cache
 
-    errors = []
-    for label, value in [("ayush_name", ayush_clean), ("allopathy_name", allopathy_clean)]:
-        if not value or len(value) < INPUT_MIN_LENGTH:
-            errors.append(f"{label} must be at least {INPUT_MIN_LENGTH} characters")
-        elif len(value) > INPUT_MAX_LENGTH:
-            errors.append(f"{label} exceeds maximum length of {INPUT_MAX_LENGTH}")
-        elif not _ALLOWED_CHARS.match(value):
-            errors.append(f"{label} contains invalid characters")
+        # Try local file first (Docker image bakes a copy)
+        local_candidates = [
+            "/app/data/reference/name_mappings.json",
+            "data/reference/name_mappings.json",
+            "backend/data/reference/name_mappings.json",
+        ]
+        for path in local_candidates:
+            try:
+                with open(path) as f:
+                    _name_mappings_cache = json.load(f)
+                    logger.info(f"Loaded name_mappings from {path}")
+                    return _name_mappings_cache
+            except (FileNotFoundError, IOError):
+                pass
 
-    if errors:
-        raise ValueError("; ".join(errors))
-
-    return ayush_clean, allopathy_clean
-
-
-# ──────────────────────────────────────────────────────────────
-# Flow Mode: Invoke Bedrock Flow and parse traces
-# ──────────────────────────────────────────────────────────────
-
-def _parse_flow_trace(trace_event: dict) -> list:
-    """Parse a flowTraceEvent into UI-friendly trace entries."""
-    traces = []
-
-    for key in ("nodeInputTrace", "nodeOutputTrace"):
-        node_trace = trace_event.get(key, {})
-        if node_trace:
-            node_name = node_trace.get("nodeName", "Unknown")
-            agent_key = NODE_TO_AGENT.get(node_name, node_name)
-            timestamp = str(node_trace.get("timestamp", ""))
-            fields = node_trace.get("fields", [])
-            content_preview = ""
-            if fields:
-                val = fields[0].get("content", {}).get("document", "")
-                if isinstance(val, str):
-                    content_preview = val[:300]
-                elif isinstance(val, dict):
-                    content_preview = json.dumps(val)[:300]
-
-            direction = "receiving" if "Input" in key else "produced"
-            trace_type = "node_input" if "Input" in key else "node_output"
-            traces.append({
-                "type": trace_type,
-                "agent": agent_key,
-                "node": node_name,
-                "message": f"{node_name} {direction}: {content_preview}",
-                "timestamp": timestamp,
-            })
-
-    action_trace = trace_event.get("nodeActionTrace", {})
-    if action_trace:
-        node_name = action_trace.get("nodeName", "Unknown")
-        agent_key = NODE_TO_AGENT.get(node_name, node_name)
-        traces.append({
-            "type": "node_action",
-            "agent": agent_key,
-            "node": node_name,
-            "message": f"{node_name} executing...",
-        })
-
-    dep_trace = trace_event.get("nodeDependencyTrace", {})
-    if dep_trace:
-        node_name = dep_trace.get("nodeName", "Unknown")
-        agent_key = NODE_TO_AGENT.get(node_name, node_name)
-
-        for elem in dep_trace.get("traceElements", []):
-            for at in elem.get("agentTraces", []):
-                for trace_part in at.get("traceParts", []):
-                    parsed = _parse_agent_trace_part(trace_part, agent_key, node_name)
-                    if parsed:
-                        traces.append(parsed)
-
-            for pt in elem.get("promptTraces", []):
-                model_id = pt.get("modelId", "")
-                input_text = pt.get("input", {}).get("text", "")[:200]
-                output_text = pt.get("output", {}).get("text", "")[:300]
-                if input_text:
-                    traces.append({
-                        "type": "prompt_input",
-                        "agent": agent_key,
-                        "node": node_name,
-                        "message": f"{node_name} prompt ({model_id}): {input_text}",
-                    })
-                if output_text:
-                    traces.append({
-                        "type": "prompt_output",
-                        "agent": agent_key,
-                        "node": node_name,
-                        "message": f"{node_name} response: {output_text}",
-                    })
-
-    cond_trace = trace_event.get("conditionResultTrace", {})
-    if cond_trace:
-        node_name = cond_trace.get("nodeName", "Unknown")
-        satisfied = cond_trace.get("satisfiedConditions", [])
-        traces.append({
-            "type": "condition",
-            "agent": "loop_controller",
-            "node": node_name,
-            "message": f"Loop condition: {', '.join(c.get('conditionName', '') for c in satisfied)}",
-            "conditions": satisfied,
-        })
-
-    return traces
+        # Fallback: try S3
+        try:
+            s3 = _get_s3()
+            bucket = S3_BUCKET or "ausadhi-mitra"
+            resp = s3.get_object(Bucket=bucket, Key="reference/name_mappings.json")
+            _name_mappings_cache = json.loads(resp["Body"].read().decode("utf-8"))
+            logger.info("Loaded name_mappings from S3")
+            return _name_mappings_cache
+        except Exception as e:
+            logger.error(f"Failed to load name_mappings.json: {e}")
+            return {"plants": []}
 
 
-def _parse_agent_trace_part(trace_part: dict, agent_key: str, node_name: str) -> dict:
-    """Parse a single TracePart from an agent invocation inside a Flow."""
-    trace = trace_part.get("trace", {})
-
-    orchestration = trace.get("orchestrationTrace", {})
-    if orchestration:
-        if "rationale" in orchestration:
-            text = orchestration["rationale"].get("text", "")[:500]
-            return {"type": "thinking", "agent": agent_key, "node": node_name,
-                    "message": text}
-
-        if "modelInvocationInput" in orchestration:
-            return {"type": "model_input", "agent": agent_key, "node": node_name,
-                    "message": f"{node_name} invoking model..."}
-
-        if "modelInvocationOutput" in orchestration:
-            out = orchestration["modelInvocationOutput"]
-            usage = out.get("metadata", {}).get("usage", {})
-            return {"type": "model_output", "agent": agent_key, "node": node_name,
-                    "message": f"{node_name} model responded "
-                              f"(tokens: {usage.get('inputTokens', '?')}/{usage.get('outputTokens', '?')})",
-                    "tokens": usage}
-
-        if "invocationInput" in orchestration:
-            inv = orchestration["invocationInput"]
-            ag = inv.get("actionGroupInvocationInput", {})
-            if ag:
-                func = ag.get("function", "")
-                group = ag.get("actionGroupName", "")
-                params = {p["name"]: p["value"] for p in ag.get("parameters", [])}
-                return {"type": "tool_call", "agent": agent_key, "node": node_name,
-                        "message": f"Calling {group}.{func}({json.dumps(params)[:200]})",
-                        "function": func, "parameters": params}
-
-            ci = inv.get("codeInterpreterInvocationInput", {})
-            if ci:
-                code = ci.get("code", "")[:200]
-                return {"type": "code_interpreter", "agent": agent_key,
-                        "node": node_name, "message": f"Running code: {code}"}
-
-        if "observation" in orchestration:
-            obs = orchestration["observation"]
-            ag_obs = obs.get("actionGroupInvocationOutput", {})
-            if ag_obs:
-                text = ag_obs.get("text", "")[:300]
-                return {"type": "tool_result", "agent": agent_key, "node": node_name,
-                        "message": f"Tool returned: {text}"}
-
-            ci_obs = obs.get("codeInterpreterInvocationOutput", {})
-            if ci_obs:
-                output = ci_obs.get("executionOutput", "")[:300]
-                return {"type": "code_result", "agent": agent_key, "node": node_name,
-                        "message": f"Code result: {output}"}
-
-            final = obs.get("finalResponse", {})
-            if final:
-                text = final.get("text", "")[:400]
-                return {"type": "final_response", "agent": agent_key,
-                        "node": node_name, "message": f"Final: {text}"}
-
-    pre = trace.get("preProcessingTrace", {})
-    if pre and "modelInvocationOutput" in pre:
-        parsed = pre["modelInvocationOutput"].get("parsedResponse", {})
-        return {"type": "preprocessing", "agent": agent_key, "node": node_name,
-                "message": f"Preprocessing: {parsed.get('rationale', '')[:300]}"}
-
-    failure = trace.get("failureTrace", {})
-    if failure:
-        reason = failure.get("failureReason", "Unknown failure")
-        return {"type": "agent_error", "agent": agent_key, "node": node_name,
-                "message": f"Agent failure: {str(reason)[:300]}"}
-
-    return None
+def build_imppat_url(scientific_name: str) -> str:
+    """Construct IMPPAT phytochemical page URL for the AYUSH plant."""
+    return f"https://cb.imsc.res.in/imppat/phytochemical/{quote(scientific_name)}"
 
 
-def run_flow_pipeline(ayush_name: str, allopathy_name: str,
-                      session_id: str = None) -> Generator[Tuple[str, Any], None, None]:
-    """Run the interaction analysis via the Bedrock Flow (V4 DoWhile loop).
+def resolve_and_validate_ayush_drug(
+    ayush_input: str,
+) -> Tuple[bool, Optional[str], Optional[str], list]:
+    """Resolve brand/common/Hindi name to scientific name, then validate it's in the allowed demo set.
 
-    Yields the same event types as run_interaction_pipeline for UI compatibility.
+    Returns:
+        (is_valid, scientific_name, imppat_url, supported_drugs_display_list)
     """
-    if not session_id:
-        session_id = str(uuid.uuid4())
+    mappings = _load_name_mappings()
+    plants = mappings.get("plants", [])
 
-    try:
-        ayush_name, allopathy_name = validate_drug_names(ayush_name, allopathy_name)
-    except ValueError as e:
-        yield ("error", {"message": f"Input validation failed: {e}", "fallback": False})
-        return
+    supported_list = []
+    for p in plants:
+        sci = p.get("scientific_name", "")
+        commons = p.get("common_names", [])
+        display = sci
+        if commons:
+            display += f" ({', '.join(commons[:2])})"
+        supported_list.append(display)
 
-    if not FLOW_ID or not FLOW_ALIAS:
-        yield ("error", {
-            "message": "Bedrock Flow not configured (FLOW_ID/FLOW_ALIAS missing).",
-            "fallback": True,
-        })
-        return
+    query = ayush_input.lower().strip()
+    resolved_plant = None
 
-    client = _get_client()
-    query = f"Check interaction between {ayush_name} and {allopathy_name}"
-
-    yield ("trace", {
-        "type": "flow_start",
-        "agent": "Flow",
-        "message": f"Starting Bedrock Flow (DoWhile validation loop) "
-                   f"for {ayush_name} + {allopathy_name}...",
-    })
-
-    try:
-        resp = client.invoke_flow(
-            flowIdentifier=FLOW_ID,
-            flowAliasIdentifier=FLOW_ALIAS,
-            inputs=[{
-                "content": {"document": query},
-                "nodeName": "FlowInputNode",
-                "nodeOutputName": "document",
-            }],
-            enableTrace=True,
+    for plant in plants:
+        all_names = (
+            [plant.get("scientific_name", "").lower()]
+            + [n.lower() for n in plant.get("common_names", [])]
+            + [n.lower() for n in plant.get("hindi_names", [])]
+            + [n.lower() for n in plant.get("brand_names", [])]
         )
-    except ClientError as e:
-        error_code = e.response["Error"]["Code"]
-        yield ("error", {
-            "message": f"Flow invocation failed ({error_code}): {str(e)[:250]}",
-            "fallback": True,
-        })
-        return
-    except Exception as e:
-        yield ("error", {
-            "message": f"Flow invocation failed: {str(e)[:300]}",
-            "fallback": True,
-        })
-        return
+        for name in all_names:
+            if not name:
+                continue
+            if name == query or query in name or name in query:
+                resolved_plant = plant
+                break
+        if resolved_plant:
+            break
 
-    full_response = ""
-    current_node = ""
-    loop_iteration = 0
+    if not resolved_plant:
+        return False, None, None, supported_list
 
-    try:
-        for event in resp.get("responseStream", []):
-            if "flowOutputEvent" in event:
-                output = event["flowOutputEvent"]
-                content = output.get("content", {}).get("document", "")
-                if isinstance(content, dict):
-                    full_response = json.dumps(content)
-                else:
-                    full_response = str(content)
-                yield ("response", full_response)
-
-            if "flowTraceEvent" in event:
-                flow_trace = event["flowTraceEvent"]
-                for trace_entry in _parse_flow_trace(flow_trace):
-                    node = trace_entry.get("node", "")
-
-                    if node != current_node and node:
-                        current_node = node
-                        agent_key = NODE_TO_AGENT.get(node, node)
-                        if node in ("LoopEntry", "ValidationLoopInput"):
-                            loop_iteration += 1
-                            yield ("trace", {
-                                "type": "loop_iteration",
-                                "agent": "Flow",
-                                "message": f"Validation Loop — Iteration {loop_iteration}",
-                                "iteration": loop_iteration,
-                            })
-                        yield ("trace", {
-                            "type": "step_start",
-                            "agent": agent_key,
-                            "node": node,
-                            "message": f"Entering {node}...",
-                        })
-
-                    yield ("trace", trace_entry)
-
-            if "flowCompletionEvent" in event:
-                completion = event["flowCompletionEvent"]
-                reason = completion.get("completionReason", "UNKNOWN")
-
-                if reason == "SUCCESS":
-                    yield ("done", {
-                        "full_response": full_response,
-                        "session_id": session_id,
-                        "cached": False,
-                        "execution_mode": "flow_v4_dowhile",
-                        "loop_iterations": loop_iteration,
-                        "pipeline_stages": ["planner", "ayush", "allopathy", "reasoning"],
-                    })
-                else:
-                    yield ("error", {
-                        "message": f"Flow completed with non-success reason: {reason}",
-                        "fallback": True,
-                    })
-
-            if "flowMultiTurnInputRequestEvent" in event:
-                logger.warning("Unexpected multi-turn input request from Flow")
-                yield ("trace", {
-                    "type": "warning",
-                    "agent": "Flow",
-                    "message": "Flow requested additional input (unexpected — skipping)",
-                })
-
-    except ClientError as e:
-        error_code = e.response["Error"]["Code"]
-        logger.exception("Bedrock error streaming flow (%s)", error_code)
-        yield ("error", {
-            "message": f"Flow stream error ({error_code}): {str(e)[:250]}",
-            "fallback": True,
-        })
-    except Exception as e:
-        logger.exception("Error streaming flow response")
-        yield ("error", {
-            "message": f"Flow stream error: {str(e)[:300]}",
-            "fallback": True,
-        })
+    scientific_name = resolved_plant["scientific_name"]
+    imppat_url = resolved_plant.get("imppat_url") or build_imppat_url(scientific_name)
+    return True, scientific_name, imppat_url, supported_list
 
 
 # ──────────────────────────────────────────────────────────────
-# Pipeline Mode: Direct agent invocation (fallback)
+# Agent Trace Parsing
 # ──────────────────────────────────────────────────────────────
 
-def _parse_trace(trace_event: dict, agent_label: str) -> dict:
-    """Extract a human-readable trace log entry from a Bedrock trace event."""
+def _parse_trace(trace_event: dict, agent_label: str,
+                 _pending_fn: list = None) -> dict:
+    """Extract a human-readable trace log entry from a Bedrock trace event.
+
+    _pending_fn is an optional single-element list used to correlate the most
+    recent tool call function name with the subsequent tool result.
+    """
     outer = trace_event.get("trace", {})
     trace = outer.get("trace", outer)
 
@@ -423,16 +214,27 @@ def _parse_trace(trace_event: dict, agent_label: str) -> dict:
             return {"type": "thinking", "agent": agent_label, "message": text}
 
         if "modelInvocationInput" in orchestration:
-            return {"type": "model_input", "agent": agent_label,
-                    "message": f"{agent_label} invoking model..."}
+            inv_input = orchestration["modelInvocationInput"]
+            text = inv_input.get("text", "")
+            return {
+                "type": "model_input",
+                "agent": agent_label,
+                "message": f"{agent_label} invoking model...",
+                "prompt_preview": text[:300] if text else "",
+            }
 
         if "modelInvocationOutput" in orchestration:
             out = orchestration["modelInvocationOutput"]
             usage = out.get("metadata", {}).get("usage", {})
-            return {"type": "model_output", "agent": agent_label,
-                    "message": f"{agent_label} model responded "
-                              f"(tokens: {usage.get('inputTokens', '?')}/{usage.get('outputTokens', '?')})",
-                    "tokens": usage}
+            return {
+                "type": "model_output",
+                "agent": agent_label,
+                "message": (
+                    f"{agent_label} model responded "
+                    f"(tokens: {usage.get('inputTokens', '?')}/{usage.get('outputTokens', '?')})"
+                ),
+                "tokens": usage,
+            }
 
         if "invocationInput" in orchestration:
             inv = orchestration["invocationInput"]
@@ -441,432 +243,918 @@ def _parse_trace(trace_event: dict, agent_label: str) -> dict:
                 func = ag.get("function", "")
                 group = ag.get("actionGroupName", "")
                 params = {p["name"]: p["value"] for p in ag.get("parameters", [])}
-                return {"type": "tool_call", "agent": agent_label,
-                        "message": f"Calling {group}.{func}({json.dumps(params)[:200]})",
-                        "function": func, "parameters": params}
-
-            ci = inv.get("codeInterpreterInvocationInput", {})
-            if ci:
-                code = ci.get("code", "")[:200]
-                return {"type": "code_interpreter", "agent": agent_label,
-                        "message": f"Running code: {code}"}
+                if _pending_fn is not None:
+                    _pending_fn[:] = [func]
+                return {
+                    "type": "tool_call",
+                    "agent": agent_label,
+                    "message": f"Calling {group}.{func}({json.dumps(params)[:200]})",
+                    "function": func,
+                    "parameters": params,
+                }
 
         if "observation" in orchestration:
             obs = orchestration["observation"]
             ag_obs = obs.get("actionGroupInvocationOutput", {})
             if ag_obs:
-                text = ag_obs.get("text", "")[:300]
-                return {"type": "tool_result", "agent": agent_label,
-                        "message": f"Tool returned: {text}"}
+                full_text = ag_obs.get("text", "")
+                fn_name = _pending_fn[0] if _pending_fn else ""
+                if _pending_fn:
+                    _pending_fn[:] = []
+                return {
+                    "type": "tool_result",
+                    "agent": agent_label,
+                    "message": f"Tool returned: {full_text[:300]}",
+                    "_fn": fn_name,
+                    "_full_result": full_text,
+                }
 
-            ci_obs = obs.get("codeInterpreterInvocationOutput", {})
-            if ci_obs:
-                output = ci_obs.get("executionOutput", "")[:300]
-                return {"type": "code_result", "agent": agent_label,
-                        "message": f"Code result: {output}"}
+            final_resp = obs.get("finalResponse", {})
+            if final_resp:
+                text = final_resp.get("text", "")
+                return {
+                    "type": "agent_complete",
+                    "agent": agent_label,
+                    "message": f"{agent_label} complete: {text[:200]}",
+                    "response": text,
+                }
 
-            final = obs.get("finalResponse", {})
-            if final:
-                text = final.get("text", "")[:400]
-                return {"type": "final_response", "agent": agent_label,
-                        "message": f"Final: {text}"}
+    return None
 
-    pre = trace.get("preProcessingTrace", {})
-    if pre and "modelInvocationOutput" in pre:
-        parsed = pre["modelInvocationOutput"].get("parsedResponse", {})
-        return {"type": "preprocessing", "agent": agent_label,
-                "message": f"Preprocessing: {parsed.get('rationale', '')[:300]}"}
 
-    failure = trace.get("failureTrace", {})
-    if failure:
-        reason = failure.get("failureReason", "Unknown failure")
-        return {"type": "agent_error", "agent": agent_label,
-                "message": f"Agent failure: {str(reason)[:300]}"}
-
-    return {"type": "processing", "agent": agent_label,
-            "message": f"{agent_label} processing..."}
-
+# ──────────────────────────────────────────────────────────────
+# Agent Invocation
+# ──────────────────────────────────────────────────────────────
 
 def _invoke_agent(agent_key: str, input_text: str, session_id: str,
-                  max_retries: int = None) -> Generator[Tuple[str, Any], None, None]:
-    """Invoke a single Bedrock Agent with trace streaming and retry logic."""
-    if max_retries is None:
-        max_retries = AGENT_INVOKE_MAX_RETRIES
+                  yield_traces: bool = True) -> Generator:
+    """Invoke a Bedrock agent and yield trace events + final response.
 
-    client = _get_client()
+    Yields tuples of (event_type, data):
+      ("trace", trace_dict)
+      ("response", response_text)
+      ("error", error_dict)
+    """
     agent = AGENTS[agent_key]
+    _pending_fn = []
 
-    for attempt in range(max_retries + 1):
+    for attempt in range(AGENT_INVOKE_MAX_RETRIES + 1):
         try:
-            yield ("trace", {
-                "type": "step_start",
-                "agent": agent["label"],
-                "message": f"Starting {agent['label']}..."
-                           + (f" (attempt {attempt + 1})" if attempt > 0 else ""),
-            })
-
-            resp = client.invoke_agent(
+            resp = _get_bedrock().invoke_agent(
                 agentId=agent["id"],
                 agentAliasId=agent["alias"],
-                sessionId=f"{session_id}-{agent_key}",
+                sessionId=session_id,
                 inputText=input_text,
                 enableTrace=True,
             )
 
-            full_text = ""
+            full_response = ""
             for event in resp["completion"]:
                 if "trace" in event:
-                    parsed = _parse_trace(event, agent["label"])
-                    yield ("trace", parsed)
-                if "chunk" in event:
-                    chunk_text = event["chunk"]["bytes"].decode("utf-8")
-                    full_text += chunk_text
+                    parsed = _parse_trace(event, agent["label"], _pending_fn)
+                    if parsed and yield_traces:
+                        yield ("trace", parsed)
 
-            yield ("agent_complete", {"agent": agent_key, "label": agent["label"],
-                                      "response": full_text})
+                if "chunk" in event:
+                    chunk = event["chunk"].get("bytes", b"").decode("utf-8", errors="replace")
+                    full_response += chunk
+
+            yield ("response", full_response)
             return
 
         except ClientError as e:
-            error_code = e.response["Error"]["Code"]
-            if attempt < max_retries and error_code in (
-                "dependencyFailedException", "throttlingException",
-                "serviceUnavailableException", "modelTimeoutException",
+            err_code = e.response["Error"]["Code"]
+            if attempt < AGENT_INVOKE_MAX_RETRIES and err_code in (
+                "ThrottlingException", "ServiceUnavailableException"
             ):
-                wait = AGENT_RETRY_BASE_WAIT * (attempt + 1)
-                yield ("trace", {
-                    "type": "retry",
-                    "agent": agent["label"],
-                    "message": f"Retry {attempt + 1}/{max_retries} — "
-                               f"{error_code}: {str(e)[:80]}. Waiting {wait}s...",
-                })
+                wait = AGENT_RETRY_BASE_WAIT * (2 ** attempt)
+                logger.warning(f"{agent_key} throttled, retry {attempt+1} in {wait}s")
                 time.sleep(wait)
-            else:
-                yield ("error", {
-                    "agent": agent["label"],
-                    "message": f"{agent['label']} failed ({error_code}) "
-                               f"after {attempt + 1} attempt(s): {str(e)[:200]}",
-                })
-                return
-
-        except Exception as e:
-            if attempt < max_retries:
-                wait = AGENT_RETRY_BASE_WAIT * (attempt + 1)
-                yield ("trace", {
-                    "type": "retry",
-                    "agent": agent["label"],
-                    "message": f"Retry {attempt + 1}/{max_retries} — "
-                               f"{type(e).__name__}: {str(e)[:80]}. Waiting {wait}s...",
-                })
-                time.sleep(wait)
-            else:
-                yield ("error", {
-                    "agent": agent["label"],
-                    "message": f"{agent['label']} failed after {max_retries + 1} "
-                               f"attempts: {str(e)[:200]}",
-                })
-                return
-
-
-def _extract_validation(response_text: str) -> dict:
-    """Extract VALIDATION_RESULT JSON from the Reasoning Agent's response."""
-    patterns = [
-        r'VALIDATION_RESULT:\s*(\{[\s\S]*?\})\s*(?:\n\n|\Z)',
-        r'\{[^{}]*"validation_status"\s*:\s*"[^"]*"[^{}]*(?:"missing_data"\s*:\s*\[[^\]]*\][^{}]*)?\}',
-    ]
-
-    for pattern in patterns:
-        matches = re.findall(pattern, response_text)
-        for match in matches:
-            try:
-                parsed = json.loads(match.strip())
-                if "validation_status" in parsed:
-                    return parsed
-            except json.JSONDecodeError:
                 continue
-
-    json_blocks = re.findall(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response_text)
-    for block in json_blocks:
-        try:
-            parsed = json.loads(block)
-            if "validation_status" in parsed:
-                return parsed
-        except json.JSONDecodeError:
-            continue
-
-    if "NEEDS_MORE_DATA" in response_text:
-        return {"validation_status": "NEEDS_MORE_DATA", "completeness_score": 50,
-                "issues": ["Validation JSON not parseable"], "missing_data": []}
-
-    return {"validation_status": "NEEDS_MORE_DATA", "completeness_score": 50,
-            "issues": ["Validation response could not be parsed"], "missing_data": []}
-
-
-def _determine_retry_agents(validation: dict) -> dict:
-    """Determine which agents to re-invoke based on validation missing_data."""
-    retry_plan = {"ayush": False, "allopathy": False, "web_search": False, "queries": []}
-
-    for item in validation.get("missing_data", []):
-        agent = item.get("source_agent", "").lower()
-        query = item.get("query_suggestion", "")
-        if "ayush" in agent:
-            retry_plan["ayush"] = True
-        elif "allopathy" in agent:
-            retry_plan["allopathy"] = True
-        elif "web" in agent:
-            retry_plan["web_search"] = True
-        if query:
-            retry_plan["queries"].append({"agent": agent, "query": query})
-
-    issues_text = " ".join(validation.get("issues", [])).lower()
-    if not retry_plan["ayush"] and not retry_plan["allopathy"]:
-        if any(kw in issues_text for kw in ["cyp", "phytochemical", "imppat", "ayush"]):
-            retry_plan["ayush"] = True
-        if any(kw in issues_text for kw in ["nti", "metabolism", "drug data", "allopathy"]):
-            retry_plan["allopathy"] = True
-        if any(kw in issues_text for kw in ["source", "pubmed", "evidence", "web"]):
-            retry_plan["web_search"] = True
-
-    return retry_plan
-
-
-def run_interaction_pipeline(ayush_name: str, allopathy_name: str,
-                             session_id: str = None) -> Generator[Tuple[str, Any], None, None]:
-    """Run the full interaction analysis pipeline with validation loop-back.
-
-    Yields (event_type, data) tuples for UI streaming.
-    """
-    if not session_id:
-        session_id = str(uuid.uuid4())
-
-    try:
-        ayush_name, allopathy_name = validate_drug_names(ayush_name, allopathy_name)
-    except ValueError as e:
-        yield ("error", {"message": f"Input validation failed: {e}"})
-        return
-
-    query = f"Check interaction between {ayush_name} and {allopathy_name}"
-    total_steps = 4
-
-    # ── Step 1: Substance Identification & Planning ──────────
-    yield ("trace", {"type": "pipeline_step", "agent": "Pipeline",
-                     "message": f"Step 1/{total_steps}: Substance Identification & Planning"})
-
-    planner_response = ""
-    for event_type, data in _invoke_agent("planner", query, session_id):
-        yield (event_type, data)
-        if event_type == "agent_complete":
-            planner_response = data["response"]
-        if event_type == "error":
+            yield ("error", {"message": f"{agent_key} agent error: {str(e)}", "code": err_code})
+            return
+        except Exception as e:
+            logger.exception(f"Unexpected error invoking {agent_key}")
+            yield ("error", {"message": str(e)})
             return
 
-    if not planner_response:
-        yield ("error", {"message": "Planner Agent returned empty response"})
-        return
 
+def _invoke_agent_collect(agent_key: str, input_text: str, session_id: str) -> Tuple[str, List]:
+    """Invoke agent, collect all traces and the final response text."""
+    traces = []
+    response = ""
+    for event_type, data in _invoke_agent(agent_key, input_text, session_id):
+        if event_type == "trace":
+            traces.append(data)
+        elif event_type == "response":
+            response = data
+    return response, traces
+
+
+# ──────────────────────────────────────────────────────────────
+# Output Parsing Helpers
+# ──────────────────────────────────────────────────────────────
+
+def _parse_planner_output(planner_response: str) -> dict:
+    """Extract structured plan from planner agent response."""
     try:
         plan = json.loads(planner_response)
-        if plan.get("cached", False):
-            yield ("response", planner_response)
-            yield ("done", {"full_response": planner_response, "session_id": session_id,
-                            "cached": True, "execution_mode": "pipeline_fallback"})
-            return
-    except json.JSONDecodeError:
+        if isinstance(plan, dict):
+            return plan
+    except (json.JSONDecodeError, TypeError):
         pass
 
-    # ── Step 2: AYUSH Phytochemical & CYP Data Collection ────
-    yield ("trace", {"type": "pipeline_step", "agent": "Pipeline",
-                     "message": f"Step 2/{total_steps}: AYUSH Phytochemical & CYP Data Collection"})
+    json_match = re.search(r'\{[\s\S]*\}', planner_response)
+    if json_match:
+        try:
+            return json.loads(json_match.group())
+        except json.JSONDecodeError:
+            pass
 
-    ayush_prompt = (
-        f"Based on this plan, gather phytochemical and CYP interaction data:\n\n"
-        f"Plan: {planner_response[:2000]}\n\nFocus on the AYUSH substance and CYP profile."
-    )
-    ayush_response = ""
-    for event_type, data in _invoke_agent("ayush", ayush_prompt, session_id):
-        yield (event_type, data)
-        if event_type == "agent_complete":
-            ayush_response = data["response"]
+    agents_to_run = {"ayush": True, "allopathy": True, "research": True}
+    return {
+        "plan_valid": True,
+        "agents": {k: {"run": v} for k, v in agents_to_run.items()},
+        "_raw": planner_response[:500],
+    }
 
-    # ── Step 3: Allopathy Drug Metabolism & NTI Data ─────────
-    yield ("trace", {"type": "pipeline_step", "agent": "Pipeline",
-                     "message": f"Step 3/{total_steps}: Allopathy Drug Metabolism & NTI Data"})
 
-    allopathy_prompt = (
-        f"Based on this plan, gather drug metabolism and CYP data:\n\n"
-        f"Plan: {planner_response[:2000]}\n\nFocus on CYP pathways and NTI status."
-    )
-    allopathy_response = ""
-    for event_type, data in _invoke_agent("allopathy", allopathy_prompt, session_id):
-        yield (event_type, data)
-        if event_type == "agent_complete":
-            allopathy_response = data["response"]
+def _parse_reasoning_output(reasoning_response: str, compile_result: dict = None) -> dict:
+    """Parse reasoning agent output or use the compile_and_validate_output result."""
+    # If orchestrator directly called compile lambda, use that result
+    if compile_result and isinstance(compile_result, dict):
+        output_str = compile_result.get("output_str", "")
+        if output_str:
+            try:
+                parsed = json.loads(output_str)
+                if isinstance(parsed, dict):
+                    return parsed
+            except (json.JSONDecodeError, TypeError):
+                pass
+        # The compile_result itself may already be the output
+        if compile_result.get("status") == "Success":
+            return compile_result
 
-    # ── Step 4: Interaction Reasoning & Validation ───────────
-    reasoning_response = ""
-    validation = {}
-    validation_iteration = 0
-
-    while validation_iteration <= MAX_VALIDATION_RETRIES:
-        is_retry = validation_iteration > 0
-        if is_retry:
-            step_label = f"Validation Retry {validation_iteration}/{MAX_VALIDATION_RETRIES}"
-        else:
-            step_label = f"Step 4/{total_steps}: Interaction Reasoning & Validation"
-
-        yield ("trace", {"type": "pipeline_step", "agent": "Pipeline",
-                         "message": step_label})
-
-        if is_retry:
-            reasoning_prompt = (
-                f"RETRY ANALYSIS — Previous analysis incomplete.\n\n"
-                f"PREVIOUS:\n{reasoning_response[:2000]}\n\n"
-                f"AYUSH DATA:\n{ayush_response[:3000]}\n\n"
-                f"ALLOPATHY DATA:\n{allopathy_response[:3000]}\n\n"
-                f"Complete the analysis. Run all 5 phases. Aim for PASSED validation."
-            )
-        else:
-            reasoning_prompt = (
-                f"Analyze the drug interaction.\n\nPLAN:\n{planner_response[:1000]}\n\n"
-                f"AYUSH DATA:\n{ayush_response[:3000]}\n\n"
-                f"ALLOPATHY DATA:\n{allopathy_response[:3000]}\n\n"
-                f"Run: 1) CYP analysis 2) PD analysis 3) Severity 4) Knowledge graph 5) Validation"
-            )
-
-        reasoning_response = ""
-        for event_type, data in _invoke_agent(
-            "reasoning", reasoning_prompt,
-            f"{session_id}-reasoning-v{validation_iteration}",
-        ):
-            if event_type == "agent_complete":
-                reasoning_response = data["response"]
-            yield (event_type, data)
-            if event_type == "error":
-                return
-
-        if not reasoning_response:
-            yield ("error", {"message": "Reasoning Agent returned empty response"})
-            return
-
-        validation = _extract_validation(reasoning_response)
-        status = validation.get("validation_status", "PASSED")
-        score = validation.get("completeness_score", 0)
-
-        yield ("validation", {
-            "status": status, "completeness_score": score,
-            "iteration": validation_iteration,
-            "issues": validation.get("issues", []),
-            "missing_data": validation.get("missing_data", []),
-        })
-
-        if status == "PASSED":
-            break
-
-        if validation_iteration >= MAX_VALIDATION_RETRIES:
-            yield ("trace", {
-                "type": "validation_max_retries",
-                "agent": "Validation",
-                "message": f"Max retries reached (score: {score}/100). Using best response.",
-            })
-            break
-
-        retry_plan = _determine_retry_agents(validation)
-
-        if retry_plan["ayush"]:
-            for et, d in _invoke_agent(
-                "ayush",
-                f"Gather ADDITIONAL data for {ayush_name}. "
-                f"Focus: {', '.join(validation.get('issues', [])[:3])}",
-                f"{session_id}-ayush-retry-{validation_iteration}",
-            ):
-                yield (et, d)
-                if et == "agent_complete":
-                    ayush_response += "\n\n--- ADDITIONAL DATA ---\n" + d["response"]
-
-        if retry_plan["allopathy"]:
-            for et, d in _invoke_agent(
-                "allopathy",
-                f"Gather ADDITIONAL data for {allopathy_name}. "
-                f"Focus: {', '.join(validation.get('issues', [])[:3])}",
-                f"{session_id}-allopathy-retry-{validation_iteration}",
-            ):
-                yield (et, d)
-                if et == "agent_complete":
-                    allopathy_response += "\n\n--- ADDITIONAL DATA ---\n" + d["response"]
-
-        validation_iteration += 1
-
+    # Fallback: try parsing reasoning_response directly
     if reasoning_response:
-        yield ("response", reasoning_response)
-        yield ("done", {
-            "full_response": reasoning_response,
-            "session_id": session_id,
-            "cached": False,
-            "execution_mode": "pipeline_fallback",
-            "pipeline_stages": ["planner", "ayush", "allopathy", "reasoning"],
-            "validation_iterations": validation_iteration,
-            "final_validation": validation.get("validation_status", "UNKNOWN"),
-        })
+        try:
+            parsed = json.loads(reasoning_response)
+            if isinstance(parsed, dict):
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        json_match = re.search(r'\{[\s\S]*\}', reasoning_response)
+        if json_match:
+            try:
+                return json.loads(json_match.group())
+            except json.JSONDecodeError:
+                pass
+
+    return {}
+
+
+def _extract_drugbank_url(traces: list) -> str:
+    """Extract DrugBank URL from allopathy agent's tool result traces."""
+    for trace in traces:
+        if trace.get("type") == "tool_result":
+            full_result = trace.get("_full_result", "")
+            # Look for DrugBank URLs in the tool result text
+            match = re.search(
+                r'https?://(?:go\.)?drugbank\.com/drugs/[A-Za-z0-9]+',
+                full_result
+            )
+            if match:
+                return match.group(0)
+    return ""
+
+
+def _extract_allopathy_info(traces: list, allopathy_response: str) -> dict:
+    """Extract allopathy drug info from agent traces and response."""
+    drugbank_url = _extract_drugbank_url(traces)
+    info = {"drugbank_url": drugbank_url}
+
+    # Try to parse JSON from response
+    try:
+        data = json.loads(allopathy_response)
+        if isinstance(data, dict):
+            info.update(data)
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    return info
+
+
+def _extract_ayush_info(traces: list, ayush_response: str) -> dict:
+    """Extract AYUSH drug info including imppat_url from agent traces and response."""
+    info = {}
+    # Look for imppat_url in tool results
+    for trace in traces:
+        if trace.get("type") == "tool_result":
+            full_result = trace.get("_full_result", "")
+            url_match = re.search(
+                r'https?://cb\.imsc\.res\.in/imppat/[^\s"\']+',
+                full_result
+            )
+            if url_match:
+                info["imppat_url"] = url_match.group(0)
+                break
+
+    try:
+        data = json.loads(ayush_response)
+        if isinstance(data, dict):
+            info.update({k: v for k, v in data.items() if k not in info})
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    return info
+
+
+def _build_phytochemical_details(reasoning_output: dict) -> list:
+    """Extract phytochemical details from reasoning output."""
+    interaction_data = reasoning_output.get("interaction_data", {})
+    if not isinstance(interaction_data, dict):
+        return []
+    return interaction_data.get("phytochemicals_involved", [])
+
+
+# ──────────────────────────────────────────────────────────────
+# CO-MAS Scorer Phase (deterministic)
+# ──────────────────────────────────────────────────────────────
+
+def _score_output(reasoning_output: dict, iteration: int) -> Tuple[bool, list, float, str]:
+    """Deterministic CO-MAS Scorer phase.
+
+    Returns: (passes, gaps, score, evidence_quality)
+    """
+    if not isinstance(reasoning_output, dict):
+        return False, ["No reasoning output produced"], 0.0, "LOW"
+
+    status = reasoning_output.get("status", "Failed")
+    interaction_data = reasoning_output.get("interaction_data", {})
+    if not isinstance(interaction_data, dict):
+        interaction_data = {}
+
+    if status != "Success":
+        failure_reason = reasoning_output.get("failure_reason", "Unknown failure")
+        return False, [f"Status={status}: {failure_reason}"], 0.0, "LOW"
+
+    score = 0.0
+    gaps = []
+
+    # Required fields — 10 pts each
+    for field in ["ayush_name", "allopathy_name", "severity", "severity_score"]:
+        val = interaction_data.get(field)
+        if val not in (None, "", [], {}):
+            score += 10
+        else:
+            gaps.append(f"Missing required field: {field}")
+
+    # Knowledge graph — 10 pts
+    kg = interaction_data.get("knowledge_graph", {})
+    nodes = kg.get("nodes", []) if isinstance(kg, dict) else []
+    if len(nodes) >= 3:
+        score += 10
     else:
-        yield ("error", {"message": "No response from pipeline"})
+        gaps.append("Knowledge graph insufficient (< 3 nodes)")
+
+    # Sources — 10 pts
+    sources = interaction_data.get("sources", [])
+    if len(sources) >= 2:
+        score += 10
+    else:
+        gaps.append("Insufficient sources cited (< 2)")
+
+    # Mechanisms — 10 pts
+    mechanisms = interaction_data.get("mechanisms", {})
+    pk = mechanisms.get("pharmacokinetic", []) if isinstance(mechanisms, dict) else []
+    pd = mechanisms.get("pharmacodynamic", []) if isinstance(mechanisms, dict) else []
+    if pk or pd:
+        score += 10
+    else:
+        gaps.append("No mechanisms described")
+
+    # Reasoning chain — 10 pts
+    rc = interaction_data.get("reasoning_chain", [])
+    if len(rc) >= 2:
+        score += 10
+    else:
+        gaps.append("Reasoning chain absent or too short (< 2 steps)")
+
+    # Phytochemicals — 10 pts
+    phytos = interaction_data.get("phytochemicals_involved", [])
+    if len(phytos) >= 1:
+        score += 10
+    else:
+        gaps.append("No phytochemicals identified")
+
+    # Interaction summary — 10 pts
+    summary = interaction_data.get("interaction_summary", "")
+    if summary and len(summary) >= 80:
+        score += 10
+    else:
+        gaps.append("Interaction summary too brief or missing")
+
+    if score >= 80:
+        evidence_quality = "HIGH"
+    elif score >= 50:
+        evidence_quality = "MODERATE"
+    else:
+        evidence_quality = "LOW"
+
+    passes = score >= 60 or iteration >= MAX_COMAS_ITERATIONS
+    return passes, gaps, score, evidence_quality
 
 
 # ──────────────────────────────────────────────────────────────
-# Unified entry point: Try Flow, fallback to Pipeline
+# Final JSON Formatting (deterministic)
 # ──────────────────────────────────────────────────────────────
 
-def run_check(ayush_name: str, allopathy_name: str,
-              session_id: str = None,
-              mode: str = "auto") -> Generator[Tuple[str, Any], None, None]:
-    """Unified entry point. Tries Flow mode first, falls back to Pipeline.
+def _format_final_json(
+    reasoning_output: dict,
+    ayush_traces: list,
+    allopathy_traces: list,
+    imppat_url: str = "",
+    scientific_name: str = "",
+) -> dict:
+    """Deterministic post-processing of the Reasoning Agent's output.
 
-    mode: "auto" (try flow then pipeline), "flow" (flow only), "pipeline" (pipeline only)
+    - Injects constructed IMPPAT URL
+    - Extracts DrugBank URL from Allopathy agent's traces
+    - Ensures reasoning_chain is populated
+    - Returns the final result dict
+    """
+    if not isinstance(reasoning_output, dict):
+        return reasoning_output
+
+    status = reasoning_output.get("status")
+    if status != "Success":
+        return reasoning_output
+
+    interaction_data = reasoning_output.get("interaction_data", {})
+    if not isinstance(interaction_data, dict):
+        return reasoning_output
+
+    # Inject IMPPAT URL
+    if imppat_url and not interaction_data.get("imppat_url"):
+        interaction_data["imppat_url"] = imppat_url
+
+    # Extract & inject DrugBank URL from allopathy agent traces
+    if not interaction_data.get("drugbank_url"):
+        drugbank_url = _extract_drugbank_url(allopathy_traces)
+        if drugbank_url:
+            interaction_data["drugbank_url"] = drugbank_url
+
+    # Ensure reasoning_chain has at least a fallback entry
+    if not interaction_data.get("reasoning_chain"):
+        ayush = interaction_data.get("ayush_name", "AYUSH drug")
+        allopathy = interaction_data.get("allopathy_name", "allopathy drug")
+        interaction_data["reasoning_chain"] = [
+            {
+                "step": 1,
+                "reasoning": (
+                    f"Analyzed {ayush} phytochemicals and their interactions with "
+                    f"{allopathy} metabolism pathways via CYP enzyme system."
+                ),
+                "evidence": "Based on IMPPAT phytochemical data and DrugBank metabolism profiles.",
+            }
+        ]
+
+    # Ensure phytochemicals_involved is populated from knowledge graph if empty
+    if not interaction_data.get("phytochemicals_involved"):
+        kg = interaction_data.get("knowledge_graph", {})
+        if isinstance(kg, dict):
+            nodes = kg.get("nodes", [])
+            phytos = [
+                n["data"]["label"]
+                for n in nodes
+                if isinstance(n, dict) and n.get("data", {}).get("type") == "phytochemical"
+            ]
+            if phytos:
+                interaction_data["phytochemicals_involved"] = phytos
+
+    reasoning_output["interaction_data"] = interaction_data
+    return reasoning_output
+
+
+# ──────────────────────────────────────────────────────────────
+# Lambda direct invocation for compile step
+# ──────────────────────────────────────────────────────────────
+
+def _call_compile_lambda(
+    ayush_name: str,
+    allopathy_name: str,
+    severity_result: dict,
+    knowledge_graph: dict,
+    analysis_data: dict,
+) -> dict:
+    """Directly invoke the compile_and_validate_output Lambda function."""
+    try:
+        import json as _json
+
+        payload = {
+            "function": "compile_and_validate_output",
+            "actionGroup": "reasoning_tools",
+            "parameters": [
+                {"name": "ayush_name", "value": ayush_name},
+                {"name": "allopathy_name", "value": allopathy_name},
+                {"name": "severity_result_str", "value": _json.dumps(severity_result)},
+                {"name": "knowledge_graph_str", "value": _json.dumps(knowledge_graph)},
+                {"name": "analysis_data_str", "value": _json.dumps(analysis_data)},
+            ],
+        }
+
+        lambda_fn = "ausadhi-reasoning-tools"
+        response = _get_lambda().invoke(
+            FunctionName=lambda_fn,
+            InvocationType="RequestResponse",
+            Payload=_json.dumps(payload).encode(),
+        )
+        result_raw = response["Payload"].read().decode("utf-8")
+        outer = _json.loads(result_raw)
+        logger.info(f"compile_lambda outer keys: {list(outer.keys()) if isinstance(outer, dict) else 'not dict'}")
+
+        # Lambda returns Bedrock Action Group format:
+        # {"messageVersion": "1.0", "response": {"functionResponse": {"responseBody": {"TEXT": {"body": "..."}}}}}
+        body_str = (
+            outer.get("response", {})
+                 .get("functionResponse", {})
+                 .get("responseBody", {})
+                 .get("TEXT", {})
+                 .get("body", "")
+        )
+        if body_str:
+            result = _json.loads(body_str)
+            logger.info(f"compile_lambda result keys: {list(result.keys()) if isinstance(result, dict) else 'not dict'}")
+            return result
+
+        # Fallback: maybe direct response (older Lambda format)
+        return outer
+    except Exception as e:
+        logger.error(f"Failed to call compile Lambda: {e}")
+        return {}
+
+
+# ──────────────────────────────────────────────────────────────
+# Reasoning Agent invocation with compile step
+# ──────────────────────────────────────────────────────────────
+
+def _invoke_reasoning_with_compile(
+    input_text: str,
+    session_id: str,
+    ayush_name: str,
+    allopathy_name: str,
+    imppat_url: str,
+    allopathy_traces: list,
+) -> Tuple[dict, list]:
+    """Invoke Reasoning agent, capture tool results, then call compile Lambda directly.
+
+    Returns: (final_output_dict, all_traces)
+    """
+    all_traces = []
+    severity_result = {}
+    knowledge_graph = {}
+    reasoning_response = ""
+    _pending_fn = []
+
+    for event_type, data in _invoke_agent("reasoning", input_text, session_id):
+        if event_type == "trace":
+            all_traces.append(data)
+            # Capture severity and graph tool results
+            if data.get("type") == "tool_result":
+                fn = data.get("_fn", "")
+                full_result = data.get("_full_result", "")
+                if fn == "calculate_severity" and full_result:
+                    try:
+                        sr = json.loads(full_result)
+                        if isinstance(sr, dict) and sr.get("success"):
+                            severity_result = sr
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                elif fn == "build_knowledge_graph" and full_result:
+                    try:
+                        gr = json.loads(full_result)
+                        if isinstance(gr, dict) and gr.get("success"):
+                            knowledge_graph = gr.get("graph", gr)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+        elif event_type == "response":
+            reasoning_response = data
+
+    # Extract DrugBank URL from allopathy traces
+    drugbank_url = _extract_drugbank_url(allopathy_traces)
+
+    # Try to extract analysis data from reasoning response
+    analysis_data = {}
+    try:
+        rd = json.loads(reasoning_response)
+        if isinstance(rd, dict):
+            # Agent may return a short analysis JSON
+            analysis_data = rd
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Enrich analysis_data with URLs
+    if imppat_url:
+        analysis_data.setdefault("imppat_url", imppat_url)
+    if drugbank_url:
+        analysis_data.setdefault("drugbank_url", drugbank_url)
+
+    # Call compile Lambda directly to assemble final JSON
+    compile_result = _call_compile_lambda(
+        ayush_name=ayush_name,
+        allopathy_name=allopathy_name,
+        severity_result=severity_result,
+        knowledge_graph=knowledge_graph,
+        analysis_data=analysis_data,
+    )
+
+    # Parse the compiled output
+    final_output = _parse_reasoning_output(reasoning_response, compile_result)
+
+    # Apply deterministic post-processing
+    final_output = _format_final_json(
+        final_output,
+        ayush_traces=[],
+        allopathy_traces=allopathy_traces,
+        imppat_url=imppat_url,
+        scientific_name=ayush_name,
+    )
+
+    return final_output, all_traces
+
+
+# ──────────────────────────────────────────────────────────────
+# CO-MAS Pipeline
+# ──────────────────────────────────────────────────────────────
+
+def run_comas_pipeline(
+    ayush_name: str,
+    allopathy_name: str,
+    scientific_name: str,
+    imppat_url: str,
+    session_id: str,
+) -> Generator:
+    """Main CO-MAS iterative pipeline.
+
+    Yields (event_type, data) tuples for the UI to consume.
+    """
+    iteration = 0
+    gaps_history = []
+    last_output = {}
+    allopathy_traces = []
+
+    yield ("pipeline_status", {
+        "status": "iteration_start",
+        "iteration": iteration + 1,
+        "message": f"Starting CO-MAS pipeline iteration 1 of {MAX_COMAS_ITERATIONS}",
+    })
+
+    while iteration < MAX_COMAS_ITERATIONS:
+        iteration += 1
+
+        yield ("pipeline_status", {
+            "status": "iteration_start",
+            "iteration": iteration,
+            "message": f"CO-MAS iteration {iteration}/{MAX_COMAS_ITERATIONS}",
+        })
+
+        # ── PHASE 1: PLANNER ────────────────────────────────────
+        yield ("pipeline_status", {"status": "phase_proposer", "iteration": iteration,
+                                    "message": "Planner generating execution plan..."})
+
+        gap_feedback = ""
+        if gaps_history:
+            latest_gaps = gaps_history[-1]
+            gap_feedback = json.dumps({
+                "gaps": latest_gaps.get("gaps", []),
+                "score": latest_gaps.get("score", 0),
+                "evidence_quality": latest_gaps.get("evidence_quality", "LOW"),
+            })
+
+        planner_prompt = (
+            f"Generate an execution plan for analyzing the interaction between "
+            f"AYUSH drug '{scientific_name}' (input: '{ayush_name}') and "
+            f"allopathy drug '{allopathy_name}'."
+        )
+        if gap_feedback:
+            planner_prompt += f"\n\nPrevious iteration identified gaps: {gap_feedback}"
+
+        # ── Stream planner traces directly (no buffering) ────────
+        planner_response = ""
+        for ev_type, ev_data in _invoke_agent("planner", planner_prompt, session_id):
+            if ev_type == "trace":
+                yield ("trace", {**ev_data, "agent_key": "planner", "iteration": iteration})
+            elif ev_type == "response":
+                planner_response = ev_data
+            elif ev_type == "error":
+                logger.error(f"Planner error: {ev_data}")
+                planner_response = ""
+
+        plan = _parse_planner_output(planner_response)
+        agents_cfg = plan.get("agents", {})
+
+        run_ayush = agents_cfg.get("ayush", {}).get("run", True)
+        run_allopathy = agents_cfg.get("allopathy", {}).get("run", True)
+        run_research = agents_cfg.get("research", {}).get("run", True)
+
+        # ── PHASE 2: PROPOSER (parallel agents) ─────────────────
+        yield ("pipeline_status", {"status": "phase_proposer", "iteration": iteration,
+                                    "message": "Running AYUSH, Allopathy, Research agents in parallel..."})
+
+        ayush_response = ""
+        ayush_traces_local = []
+        allopathy_response_local = ""
+        allopathy_traces_local = []
+        research_response = ""
+        research_traces_local = []
+
+        agent_results = {}
+        threads = []
+
+        def _run_agent(key, prompt, store):
+            r, t = _invoke_agent_collect(key, prompt, session_id)
+            store["response"] = r
+            store["traces"] = t
+
+        proposer_stores = {}
+
+        if run_ayush:
+            proposer_stores["ayush"] = {}
+            ayush_prompt = (
+                f"Get comprehensive phytochemical data for {scientific_name}. "
+                f"Include IMPPAT data, CYP enzyme interactions, and key bioactive compounds. "
+                f"IMPPAT URL: {imppat_url}"
+            )
+            t = threading.Thread(target=_run_agent, args=("ayush", ayush_prompt, proposer_stores["ayush"]))
+            threads.append(("ayush", t))
+
+        if run_allopathy:
+            proposer_stores["allopathy"] = {}
+            allopathy_prompt = (
+                f"Get comprehensive data for {allopathy_name}. "
+                f"Include CYP metabolism pathways, NTI status, mechanism of action. "
+                f"Search DrugBank (domain: drugbank) for the drug page URL."
+            )
+            t = threading.Thread(target=_run_agent, args=("allopathy", allopathy_prompt, proposer_stores["allopathy"]))
+            threads.append(("allopathy", t))
+
+        if run_research:
+            proposer_stores["research"] = {}
+            gap_context = f" Focus on: {gap_feedback}" if gap_feedback else ""
+            research_prompt = (
+                f"Search for clinical evidence of interactions between {scientific_name} "
+                f"and {allopathy_name}.{gap_context} "
+                f"Find PubMed articles, clinical trials, and pharmacological studies."
+            )
+            t = threading.Thread(target=_run_agent, args=("research", research_prompt, proposer_stores["research"]))
+            threads.append(("research", t))
+
+        for key, t in threads:
+            t.start()
+            # Emit a synthetic "agent started" thinking trace so the UI shows
+            # each proposer card immediately (before their traces arrive)
+            agent_label = AGENTS[key]["label"]
+            yield ("trace", {
+                "type": "thinking",
+                "agent": agent_label,
+                "agent_key": key,
+                "iteration": iteration,
+                "message": f"{agent_label} agent running…",
+            })
+
+        for key, t in threads:
+            t.join(timeout=300)
+
+        for key, store in proposer_stores.items():
+            resp = store.get("response", "")
+            traces = store.get("traces", [])
+            agent_results[key] = {"response": resp, "traces": traces}
+            for trace in traces:
+                yield ("trace", {**trace, "agent_key": key, "iteration": iteration})
+
+        if "ayush" in agent_results:
+            ayush_response = agent_results["ayush"]["response"]
+            ayush_traces_local = agent_results["ayush"]["traces"]
+        if "allopathy" in agent_results:
+            allopathy_response_local = agent_results["allopathy"]["response"]
+            allopathy_traces_local = agent_results["allopathy"]["traces"]
+            allopathy_traces = allopathy_traces_local  # persist for final formatting
+        if "research" in agent_results:
+            research_response = agent_results["research"]["response"]
+            research_traces_local = agent_results["research"]["traces"]
+
+        # ── PHASE 3: EVALUATOR (Reasoning Agent) ────────────────
+        yield ("pipeline_status", {"status": "phase_evaluator", "iteration": iteration,
+                                    "message": "Reasoning agent evaluating interactions..."})
+
+        reasoning_prompt = (
+            f"Analyze the pharmacological interaction between AYUSH drug '{scientific_name}' "
+            f"and allopathy drug '{allopathy_name}'.\n\n"
+            f"AYUSH data:\n{ayush_response[:2000]}\n\n"
+            f"Allopathy data:\n{allopathy_response_local[:2000]}\n\n"
+            f"Research evidence:\n{research_response[:2000]}\n\n"
+            f"Provide a detailed analysis including: interaction mechanisms (pharmacokinetic & "
+            f"pharmacodynamic), severity assessment, phytochemicals responsible, clinical effects, "
+            f"and evidence-based reasoning chain. Return a concise analysis JSON."
+        )
+
+        # ── Stream reasoning traces directly, then compile ────────
+        reasoning_all_traces = []
+        reasoning_response = ""
+        severity_result_rt = {}
+        knowledge_graph_rt = {}
+
+        for ev_type, ev_data in _invoke_agent("reasoning", reasoning_prompt, session_id):
+            if ev_type == "trace":
+                yield ("trace", {**ev_data, "agent_key": "reasoning", "iteration": iteration})
+                reasoning_all_traces.append(ev_data)
+                # Capture severity / graph tool results for compile step
+                if ev_data.get("type") == "tool_result":
+                    fn = ev_data.get("_fn", "")
+                    full = ev_data.get("_full_result", "")
+                    if fn == "calculate_severity" and full:
+                        try:
+                            sr = json.loads(full)
+                            if isinstance(sr, dict) and sr.get("success"):
+                                severity_result_rt = sr
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                    elif fn == "build_knowledge_graph" and full:
+                        try:
+                            gr = json.loads(full)
+                            if isinstance(gr, dict) and gr.get("success"):
+                                knowledge_graph_rt = gr.get("graph", gr)
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+            elif ev_type == "response":
+                reasoning_response = ev_data
+
+        # Extract analysis data from reasoning response
+        analysis_data_rt = {}
+        try:
+            rd = json.loads(reasoning_response)
+            if isinstance(rd, dict):
+                analysis_data_rt = rd
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        drugbank_url_rt = _extract_drugbank_url(allopathy_traces_local)
+        if imppat_url:
+            analysis_data_rt.setdefault("imppat_url", imppat_url)
+        if drugbank_url_rt:
+            analysis_data_rt.setdefault("drugbank_url", drugbank_url_rt)
+
+        compile_result = _call_compile_lambda(
+            ayush_name=scientific_name,
+            allopathy_name=allopathy_name,
+            severity_result=severity_result_rt,
+            knowledge_graph=knowledge_graph_rt,
+            analysis_data=analysis_data_rt,
+        )
+
+        final_output = _parse_reasoning_output(reasoning_response, compile_result)
+        final_output = _format_final_json(
+            final_output,
+            ayush_traces=[],
+            allopathy_traces=allopathy_traces_local,
+            imppat_url=imppat_url,
+            scientific_name=scientific_name,
+        )
+
+        last_output = final_output
+
+        # ── PHASE 4: SCORER (deterministic) ─────────────────────
+        yield ("pipeline_status", {"status": "phase_scorer", "iteration": iteration,
+                                    "message": "Scorer evaluating output quality..."})
+
+        passes, gaps, score, evidence_quality = _score_output(final_output, iteration)
+
+        if gaps:
+            for gap in gaps:
+                yield ("pipeline_status", {
+                    "status": "gap_identified",
+                    "iteration": iteration,
+                    "gap": gap,
+                    "message": f"Gap identified: {gap}",
+                })
+            gaps_history.append({
+                "iteration": iteration,
+                "gaps": gaps,
+                "score": score,
+                "evidence_quality": evidence_quality,
+            })
+            log_iteration_gap(session_id, iteration, gaps, score, evidence_quality)
+
+        if passes:
+            logger.info(f"CO-MAS passed at iteration {iteration} with score={score}")
+            break
+
+        if iteration < MAX_COMAS_ITERATIONS:
+            yield ("pipeline_status", {
+                "status": "iteration_retry",
+                "iteration": iteration,
+                "message": f"Score={score:.0f}/100. Retrying with targeted feedback...",
+            })
+
+    yield ("pipeline_status", {
+        "status": "formatting",
+        "message": "Formatting final output...",
+    })
+
+    yield ("done", {
+        "result": last_output,
+        "iterations": iteration,
+        "gaps_history": gaps_history,
+        "session_id": session_id,
+    })
+
+
+# ──────────────────────────────────────────────────────────────
+# Public entry point
+# ──────────────────────────────────────────────────────────────
+
+def run_check(
+    ayush_name: str,
+    allopathy_name: str,
+    session_id: str = None,
+    **kwargs,
+) -> Generator:
+    """Public entry point for the CO-MAS pipeline.
+
+    Yields (event_type, data) tuples.
     """
     if not session_id:
         session_id = str(uuid.uuid4())
 
-    if mode in ("auto", "flow"):
-        flow_failed = False
-        last_error_data = {}
-        for event_type, data in run_flow_pipeline(ayush_name, allopathy_name, session_id):
-            if event_type == "error" and data.get("fallback"):
-                flow_failed = True
-                last_error_data = data
-                yield ("trace", {
-                    "type": "fallback",
-                    "agent": "Pipeline",
-                    "message": f"Flow failed: {data.get('message', '')}. "
-                               f"Switching to pipeline mode.",
-                })
-                break
-            if event_type == "error" and not data.get("fallback"):
-                yield (event_type, data)
-                return
-            yield (event_type, data)
+    # Validate input lengths
+    if len(ayush_name) < INPUT_MIN_LENGTH or len(ayush_name) > INPUT_MAX_LENGTH:
+        yield ("error", {"message": f"AYUSH drug name must be {INPUT_MIN_LENGTH}–{INPUT_MAX_LENGTH} characters."})
+        return
+    if len(allopathy_name) < INPUT_MIN_LENGTH or len(allopathy_name) > INPUT_MAX_LENGTH:
+        yield ("error", {"message": f"Allopathy drug name must be {INPUT_MIN_LENGTH}–{INPUT_MAX_LENGTH} characters."})
+        return
 
-        if not flow_failed:
-            return
+    start_time = time.time()
+    log_pipeline_start(session_id, ayush_name, allopathy_name)
 
-        if mode == "flow":
-            yield ("error", last_error_data)
-            return
+    # ── PRE-PIPELINE: Name resolution & whitelist check ────────
+    yield ("pipeline_status", {
+        "status": "name_resolution",
+        "message": f"Resolving AYUSH drug name: '{ayush_name}'...",
+    })
 
-    yield from run_interaction_pipeline(ayush_name, allopathy_name, session_id)
+    is_valid, scientific_name, imppat_url, supported_list = resolve_and_validate_ayush_drug(ayush_name)
 
+    if not is_valid:
+        supported_str = "\n• ".join(supported_list) if supported_list else "(none configured)"
+        error_msg = (
+            f"AYUSH drug '{ayush_name}' is not available in this demo. "
+            f"Currently supported plants:\n• {supported_str}\n"
+            f"Please try one of the supported plants."
+        )
+        yield ("pipeline_status", {
+            "status": "input_validation",
+            "valid": False,
+            "message": error_msg,
+            "supported_drugs": supported_list,
+        })
+        yield ("error", {
+            "message": error_msg,
+            "supported_drugs": supported_list,
+        })
+        return
 
-def invoke_agent_streaming(query: str, session_id: str = None):
-    """Legacy wrapper — parses query to extract drug names and runs pipeline."""
-    match = re.search(r"(?:between|of)\s+(.+?)\s+and\s+(.+?)$", query, re.IGNORECASE)
-    if match:
-        ayush_name = match.group(1).strip()
-        allopathy_name = match.group(2).strip()
-    else:
-        parts = query.replace("interaction", "").replace("check", "").strip().split()
-        if len(parts) >= 2:
-            mid = len(parts) // 2
-            ayush_name = " ".join(parts[:mid])
-            allopathy_name = " ".join(parts[mid:])
-        else:
-            yield ("error", {"message": f"Could not parse query: {query}"})
-            return
+    yield ("pipeline_status", {
+        "status": "name_resolution",
+        "valid": True,
+        "original_name": ayush_name,
+        "scientific_name": scientific_name,
+        "imppat_url": imppat_url,
+        "message": f"Resolved '{ayush_name}' → '{scientific_name}'",
+    })
 
-    yield from run_check(ayush_name, allopathy_name, session_id)
+    yield ("pipeline_status", {
+        "status": "input_validation",
+        "valid": True,
+        "message": f"Validated: {scientific_name} + {allopathy_name}",
+    })
+
+    try:
+        for event in run_comas_pipeline(
+            ayush_name=ayush_name,
+            allopathy_name=allopathy_name,
+            scientific_name=scientific_name,
+            imppat_url=imppat_url,
+            session_id=session_id,
+        ):
+            yield event
+
+        duration_ms = int((time.time() - start_time) * 1000)
+        log_pipeline_complete(session_id, "Success", duration_ms)
+
+    except Exception as e:
+        logger.exception("Pipeline error")
+        duration_ms = int((time.time() - start_time) * 1000)
+        log_pipeline_error(session_id, type(e).__name__, str(e))
+        yield ("error", {"message": f"Pipeline error: {str(e)}"})

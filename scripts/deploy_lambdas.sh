@@ -125,6 +125,9 @@ deploy_lambda "ausadhi-planner-tools" "$LAMBDA_DIR/planner_tools" 30 256 \
 deploy_lambda "ausadhi-validation-parser" "$LAMBDA_DIR/validation_parser" 30 128 \
     "AushadhiMitra: Parse validation status from Reasoning Agent output"
 
+deploy_lambda "ausadhi-research-tools" "$LAMBDA_DIR/research_tools" 60 256 \
+    "AushadhiMitra: PubMed/academic domain-restricted search for clinical evidence"
+
 echo "=============================="
 echo "All Lambda functions deployed!"
 echo "=============================="
@@ -133,7 +136,7 @@ echo ""
 echo "Adding Bedrock invoke permissions..."
 for FUNC in ausadhi-check-curated-db ausadhi-ayush-data ausadhi-allopathy-data \
              ausadhi-web-search ausadhi-reasoning-tools ausadhi-planner-tools \
-             ausadhi-validation-parser; do
+             ausadhi-validation-parser ausadhi-research-tools; do
     aws lambda add-permission \
         --function-name "$FUNC" \
         --statement-id "AllowBedrockInvoke" \

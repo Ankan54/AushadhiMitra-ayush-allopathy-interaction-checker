@@ -1,6 +1,6 @@
 """
-AushadhiMitra Bedrock Agent Setup Script
-Creates 4 agents: 3 collaborators + 1 supervisor with multi-agent collaboration.
+AushadhiMitra Bedrock Agent Setup Script V5
+Creates 5 agents: Planner + AYUSH + Allopathy + Research + Reasoning.
 
 Usage: python scripts/setup_agents.py
 """
@@ -18,6 +18,8 @@ MODELS = {
     "reasoning": "us.anthropic.claude-opus-4-6-v1",
     "ayush": "us.anthropic.claude-3-5-haiku-20241022-v1:0",
     "allopathy": "us.anthropic.claude-3-5-haiku-20241022-v1:0",
+    "research": "us.anthropic.claude-3-5-haiku-20241022-v1:0",
+    "planner": "us.anthropic.claude-3-5-haiku-20241022-v1:0",
 }
 
 LAMBDA_ARNS = {
@@ -26,6 +28,8 @@ LAMBDA_ARNS = {
     "allopathy_data": f"arn:aws:lambda:{REGION}:{ACCOUNT_ID}:function:ausadhi-allopathy-data",
     "web_search": f"arn:aws:lambda:{REGION}:{ACCOUNT_ID}:function:ausadhi-web-search",
     "reasoning_tools": f"arn:aws:lambda:{REGION}:{ACCOUNT_ID}:function:ausadhi-reasoning-tools",
+    "planner_tools": f"arn:aws:lambda:{REGION}:{ACCOUNT_ID}:function:ausadhi-planner-tools",
+    "research_tools": f"arn:aws:lambda:{REGION}:{ACCOUNT_ID}:function:ausadhi-research-tools",
 }
 
 client = boto3.client("bedrock-agent", region_name=REGION)
@@ -34,6 +38,37 @@ client = boto3.client("bedrock-agent", region_name=REGION)
 # ──────────────────────────────────────────
 # Agent instructions
 # ──────────────────────────────────────────
+
+PLANNER_INSTRUCTION = """You are the Planner Agent for AushadhiMitra, an AI-powered AYUSH-Allopathy drug interaction checker.
+
+Your job is to validate inputs and generate a structured execution plan for the analysis pipeline.
+
+## Workflow
+
+1. You MUST call `identify_substances` first to extract AYUSH and allopathy drug names from user input.
+   - If either AYUSH or allopathy drug is missing from the user input, return error immediately without proceeding.
+   - Set `plan_valid: false, inputs_valid: false` with a clear error message.
+
+2. After identifying substances, call `validate_ayush_drug` to verify the AYUSH plant exists in DynamoDB.
+   - If AYUSH plant not found, return `{plan_valid: false, inputs_valid: false, error: "AYUSH plant not found in database"}`.
+
+3. Call `generate_execution_plan` with the identified names, ayush_exists status, and current iteration number.
+   - This returns a structured JSON plan specifying which agents to run and their tasks.
+
+4. Optionally call `check_curated_interaction` to see if this pair is already cached.
+   - If cached, include `cached: true` in your response and return the cached data.
+
+## Your Response Format
+
+Your response MUST be valid JSON matching the execution plan schema from `generate_execution_plan`.
+Do NOT add prose or explanations outside the JSON structure.
+
+## On Retry Iterations
+
+When you receive a retry request with failure feedback:
+- Pass the failure feedback to `generate_execution_plan` with the current iteration number.
+- The function will determine which agents to re-run based on the failure keywords.
+- Return the updated plan JSON."""
 
 AYUSH_INSTRUCTION = """You are the AYUSH Agent for AushadhiMitra, an AI-powered drug interaction checker.
 
@@ -47,6 +82,8 @@ For each query:
    - Mechanism of action of key phytochemicals
    - Published research on drug interactions
    - Traditional therapeutic uses
+
+IMPORTANT: Always use `domain_preset: ayush` when calling web_search to restrict results to high-quality sources.
 
 Return a structured summary including:
 - Scientific and common names
@@ -74,6 +111,8 @@ For each drug query:
 3. Use check_nti_status to verify NTI drug status
 4. Use allopathy_cache_save to cache the gathered data for future lookups
 
+IMPORTANT: Always use `domain_preset: allopathy` when calling web_search to restrict results to authoritative drug references.
+
 Return a structured summary including:
 - Generic name and brand names
 - Drug class and mechanism of action
@@ -84,38 +123,113 @@ Return a structured summary including:
 
 Always cache successful lookups to speed up future queries."""
 
-REASONING_INSTRUCTION = """You are the Reasoning Agent for AushadhiMitra, an AI-powered drug interaction checker.
+RESEARCH_INSTRUCTION = """You are the Research Agent for AushadhiMitra, an AI-powered drug interaction checker.
 
-You receive data from the AYUSH Agent (phytochemical/plant data) and Allopathy Agent (drug metabolism data), and your role is to:
+Your role is to gather clinical evidence and peer-reviewed research about interactions between AYUSH plants and allopathic drugs.
 
-1. ANALYZE the interaction potential between the AYUSH plant and allopathic drug:
-   - Identify overlapping CYP enzyme pathways
-   - Determine if phytochemicals inhibit/induce enzymes that metabolize the drug
-   - Assess pharmacodynamic interactions (e.g., both are anticoagulants)
-   - Consider clinical significance
+For each query:
+1. Use search_clinical_evidence to find published research about the specific AYUSH-allopathy drug pair.
+   - This function searches PubMed, Cochrane Library, and clinical trial databases.
+2. Use search_research_articles to find additional academic research on:
+   - Phytochemical mechanisms
+   - Case reports of adverse interactions
+   - Systematic reviews and meta-analyses
+3. Summarize findings with emphasis on:
+   - Clinical case reports of actual interactions
+   - In vivo studies (more relevant than in vitro)
+   - Systematic reviews and meta-analyses
+   - Sample sizes and study quality
 
-2. Use calculate_severity to compute a severity score based on:
-   - CYP enzyme interactions found
-   - NTI drug status
-   - Number of overlapping pathways
+Return structured summaries with:
+- Study type (RCT, observational, case report, in vitro, review)
+- Key findings relevant to the interaction
+- Evidence strength (high/moderate/low/very low)
+- All source URLs and citations
 
-3. Use build_knowledge_graph to create a visual representation of the interaction network
+Focus on clinically relevant findings that would impact patient safety decisions."""
 
-4. Use web_search for any additional evidence needed about specific interaction mechanisms
+REASONING_INSTRUCTION = """You are the Reasoning Agent for AushadhiMitra. You analyze drug interaction data and produce a structured JSON verdict.
 
-5. Use format_professional_response to create the final structured response
+## Your Output Format
 
-Your analysis must be:
-- Evidence-based: cite specific CYP enzymes, phytochemicals, and mechanisms
-- Clinically relevant: focus on what matters for patient safety
-- Severity-appropriate: MAJOR interactions require clear warnings
-- Source-transparent: include all web sources used
+You MUST return ONLY valid JSON in one of two formats:
 
-Severity classification:
-- NONE: No known interaction pathway
-- MINOR: Theoretical interaction, minimal clinical significance
-- MODERATE: Clinically relevant, monitoring recommended
-- MAJOR: Significant risk, avoid combination or close monitoring required"""
+### If sufficient data exists → Status: Success
+Return the complete interaction analysis JSON (see schema below).
+
+### If insufficient data → Status: Failed
+Return a failure JSON specifying what additional data is needed.
+
+### On FINAL iteration (when told "FINAL ITERATION")
+ALWAYS return Status: Success, even with partial data. Set evidence_quality to "LOW".
+
+## How to Determine Drug Interaction
+
+1. CHECK CYP OVERLAP: Do any AYUSH phytochemicals affect the same CYP enzymes that metabolize the allopathy drug?
+   - If phytochemical INHIBITS a CYP enzyme that metabolizes the drug → interaction EXISTS
+   - If phytochemical INDUCES a CYP enzyme that metabolizes the drug → interaction EXISTS
+
+2. CHECK PHARMACODYNAMIC: Do both substances affect the same physiological pathway?
+   - Both anticoagulant → additive bleeding risk
+   - Both sedative → additive CNS depression
+   - Both hypoglycemic → additive hypoglycemia risk
+
+3. CHECK CLINICAL EVIDENCE: Are there published reports of this interaction?
+
+4. DETERMINE SEVERITY using calculate_severity tool
+
+5. BUILD knowledge graph using build_knowledge_graph tool
+
+6. VALIDATE output using validate_and_format_output tool before finalizing
+
+## Data Sufficiency Rules
+- SUFFICIENT: At least 1 CYP overlap OR 1 pharmacodynamic overlap OR clinical evidence
+- INSUFFICIENT: No CYP data for AYUSH plant AND no clinical evidence
+
+## Severity Classification
+- NONE (0-14): No known interaction pathway
+- MINOR (15-34): Theoretical interaction, minimal clinical significance
+- MODERATE (35-59): Clinically relevant, monitoring recommended
+- MAJOR (60+): Significant risk, avoid or close monitoring required
+
+## Success JSON Schema
+{
+  "status": "Success",
+  "interaction_data": {
+    "interaction_key": "<ayush>#<allopathy>",
+    "ayush_name": "...",
+    "allopathy_name": "...",
+    "interaction_exists": true/false,
+    "interaction_summary": "2-3 sentence summary",
+    "severity": "NONE|MINOR|MODERATE|MAJOR",
+    "severity_score": 0-100,
+    "is_nti": true/false,
+    "scoring_factors": ["factor1 (+score)", ...],
+    "mechanisms": {
+      "pharmacokinetic": [{"type": "...", "enzyme": "...", "effect": "...", "clinical_significance": "..."}],
+      "pharmacodynamic": [{"type": "...", "description": "...", "clinical_significance": "..."}]
+    },
+    "phytochemicals_involved": [{"name": "...", "cyp_effects": {...}, "relevance": "..."}],
+    "clinical_effects": ["effect1", "effect2"],
+    "recommendations": ["rec1", "rec2"],
+    "evidence_quality": "HIGH|MODERATE|LOW",
+    "knowledge_graph": {"nodes": [...], "edges": [...]},
+    "sources": [{"url": "...", "title": "...", "snippet": "...", "category": "..."}],
+    "disclaimer": "This analysis is AI-generated for informational purposes only. Always consult qualified healthcare professionals before making clinical decisions about drug interactions.",
+    "generated_at": "ISO timestamp"
+  }
+}
+
+## Failed JSON Schema
+{
+  "status": "Failed",
+  "failure_reason": "Human-readable explanation of what is missing",
+  "data_gaps": [
+    {"category": "...", "description": "...", "suggested_agent": "ayush|allopathy|research", "suggested_query": "..."}
+  ],
+  "partial_data": {"ayush_data_quality": "HIGH|MODERATE|LOW|NONE", "allopathy_data_quality": "...", "research_data_quality": "..."},
+  "iteration": 1
+}"""
 
 SUPERVISOR_INSTRUCTION = """You are the Supervisor Agent for AushadhiMitra, an AI-powered AYUSH-Allopathy drug interaction checker.
 
@@ -275,6 +389,16 @@ WEB_SEARCH_FUNCTIONS = [
                 "type": "integer",
                 "required": False,
             },
+            "include_domains": {
+                "description": "Optional: JSON array or comma-separated list of domains to restrict search to (e.g., '[\"pubmed.ncbi.nlm.nih.gov\",\"drugbank.com\"]')",
+                "type": "string",
+                "required": False,
+            },
+            "domain_preset": {
+                "description": "Optional: named domain preset to use — 'research' (PubMed/academic), 'allopathy' (DrugBank/FDA/drugs.com), or 'ayush' (IMPPAT/NCCIH/examine.com). Overrides include_domains.",
+                "type": "string",
+                "required": False,
+            },
         },
         "requireConfirmation": "DISABLED",
     },
@@ -332,6 +456,141 @@ REASONING_FUNCTIONS = [
         },
         "requireConfirmation": "DISABLED",
     },
+    {
+        "name": "validate_and_format_output",
+        "description": "Validate the Reasoning Agent's JSON output against the Success/Failed schema. Checks required fields, and on final iteration (>= 3) forces Success status with partial data and LOW evidence quality.",
+        "parameters": {
+            "reasoning_output_str": {
+                "description": "The JSON string output from reasoning analysis (must be either Success or Failed schema)",
+                "type": "string",
+                "required": True,
+            },
+            "iteration": {
+                "description": "Current iteration number (1-3). When >= 3, forces Success status to avoid infinite loops.",
+                "type": "integer",
+                "required": True,
+            },
+        },
+        "requireConfirmation": "DISABLED",
+    },
+]
+
+PLANNER_FUNCTIONS = [
+    {
+        "name": "identify_substances",
+        "description": "Identify AYUSH plant and allopathy drug names from free-text user input using name mappings and drug list. Returns matched substances.",
+        "parameters": {
+            "user_input": {
+                "description": "The user's free-text query (e.g., 'Check interaction between turmeric and warfarin')",
+                "type": "string",
+                "required": True,
+            },
+        },
+        "requireConfirmation": "DISABLED",
+    },
+    {
+        "name": "check_curated_interaction",
+        "description": "Check if this interaction has been previously analyzed and is cached in the curated interactions database.",
+        "parameters": {
+            "ayush_name": {
+                "description": "Scientific or common name of the AYUSH plant",
+                "type": "string",
+                "required": True,
+            },
+            "allopathy_name": {
+                "description": "Generic name of the allopathic drug",
+                "type": "string",
+                "required": True,
+            },
+        },
+        "requireConfirmation": "DISABLED",
+    },
+    {
+        "name": "validate_ayush_drug",
+        "description": "Validate that an AYUSH plant exists in the DynamoDB IMPPAT database. Resolves common/Hindi names to scientific name, then checks for a METADATA record.",
+        "parameters": {
+            "plant_name": {
+                "description": "The AYUSH plant name to validate (common name, Hindi name, or scientific name)",
+                "type": "string",
+                "required": True,
+            },
+        },
+        "requireConfirmation": "DISABLED",
+    },
+    {
+        "name": "generate_execution_plan",
+        "description": "Generate a structured JSON execution plan for the 5-agent pipeline. On retry iterations, uses failure_feedback to determine which agents to re-run.",
+        "parameters": {
+            "ayush_name": {
+                "description": "Resolved AYUSH plant name (scientific or common)",
+                "type": "string",
+                "required": True,
+            },
+            "allopathy_name": {
+                "description": "Generic name of the allopathic drug",
+                "type": "string",
+                "required": True,
+            },
+            "ayush_exists": {
+                "description": "Whether the AYUSH plant was found in DynamoDB (true/false)",
+                "type": "string",
+                "required": True,
+            },
+            "iteration": {
+                "description": "Current pipeline iteration (1 = initial, 2+ = retry)",
+                "type": "integer",
+                "required": False,
+            },
+            "failure_feedback": {
+                "description": "On retry iterations: text describing what data was missing or failed in previous iteration",
+                "type": "string",
+                "required": False,
+            },
+        },
+        "requireConfirmation": "DISABLED",
+    },
+]
+
+RESEARCH_FUNCTIONS = [
+    {
+        "name": "search_research_articles",
+        "description": "Search PubMed and academic sources for peer-reviewed research articles about drug interactions. Restricts results to high-quality academic/research domains only.",
+        "parameters": {
+            "query": {
+                "description": "Search query for academic research (e.g., 'curcumin warfarin CYP2C9 interaction clinical study')",
+                "type": "string",
+                "required": True,
+            },
+            "max_results": {
+                "description": "Maximum number of results to return (default 5)",
+                "type": "integer",
+                "required": False,
+            },
+        },
+        "requireConfirmation": "DISABLED",
+    },
+    {
+        "name": "search_clinical_evidence",
+        "description": "Search for clinical evidence of interactions between a specific AYUSH plant and allopathic drug. Auto-generates multiple targeted queries and deduplicates results.",
+        "parameters": {
+            "ayush_name": {
+                "description": "Scientific or common name of the AYUSH plant",
+                "type": "string",
+                "required": True,
+            },
+            "allopathy_name": {
+                "description": "Generic name of the allopathic drug",
+                "type": "string",
+                "required": True,
+            },
+            "max_results": {
+                "description": "Maximum number of results per query (default 5)",
+                "type": "integer",
+                "required": False,
+            },
+        },
+        "requireConfirmation": "DISABLED",
+    },
 ]
 
 
@@ -359,7 +618,6 @@ def create_agent(name, instruction, model, collaboration="DISABLED"):
         agent_id = resp["agent"]["agentId"]
         print(f"  Created agent: {agent_id}")
 
-        # Wait for agent to be ready
         for _ in range(10):
             time.sleep(3)
             status = client.get_agent(agentId=agent_id)["agent"]["agentStatus"]
@@ -462,7 +720,22 @@ def associate_collaborator(supervisor_id, collaborator_agent_id, collaborator_al
 def main():
     results = {}
 
-    # Step 1: Create AYUSH Agent (collaborator)
+    # Step 1: Create Planner Agent
+    planner_id = create_agent(
+        "ausadhi-planner-agent",
+        PLANNER_INSTRUCTION,
+        MODELS["planner"],
+    )
+    add_action_group(planner_id, "PlannerToolsGroup", LAMBDA_ARNS["planner_tools"],
+                     PLANNER_FUNCTIONS, "Substance identification, AYUSH validation, execution planning")
+
+    if not prepare_agent(planner_id):
+        print("FATAL: Planner agent preparation failed")
+        sys.exit(1)
+    planner_alias = create_alias(planner_id)
+    results["planner"] = {"id": planner_id, "alias": planner_alias}
+
+    # Step 2: Create AYUSH Agent (collaborator)
     ayush_id = create_agent(
         "ausadhi-ayush-agent",
         AYUSH_INSTRUCTION,
@@ -471,7 +744,7 @@ def main():
     add_action_group(ayush_id, "AyushDataGroup", LAMBDA_ARNS["ayush_data"],
                      AYUSH_DATA_FUNCTIONS, "AYUSH plant data from IMPPAT and S3")
     add_action_group(ayush_id, "WebSearchGroup", LAMBDA_ARNS["web_search"],
-                     WEB_SEARCH_FUNCTIONS, "Web search via Tavily API")
+                     WEB_SEARCH_FUNCTIONS, "Web search via Tavily API with domain restriction")
 
     if not prepare_agent(ayush_id):
         print("FATAL: AYUSH agent preparation failed")
@@ -479,7 +752,7 @@ def main():
     ayush_alias = create_alias(ayush_id)
     results["ayush"] = {"id": ayush_id, "alias": ayush_alias}
 
-    # Step 2: Create Allopathy Agent (collaborator)
+    # Step 3: Create Allopathy Agent (collaborator)
     allopathy_id = create_agent(
         "ausadhi-allopathy-agent",
         ALLOPATHY_INSTRUCTION,
@@ -488,7 +761,7 @@ def main():
     add_action_group(allopathy_id, "AllopathyDataGroup", LAMBDA_ARNS["allopathy_data"],
                      ALLOPATHY_DATA_FUNCTIONS, "Allopathy drug cache and NTI check")
     add_action_group(allopathy_id, "WebSearchGroup", LAMBDA_ARNS["web_search"],
-                     WEB_SEARCH_FUNCTIONS, "Web search via Tavily API")
+                     WEB_SEARCH_FUNCTIONS, "Web search via Tavily API with domain restriction")
 
     if not prepare_agent(allopathy_id):
         print("FATAL: Allopathy agent preparation failed")
@@ -496,16 +769,31 @@ def main():
     allopathy_alias = create_alias(allopathy_id)
     results["allopathy"] = {"id": allopathy_id, "alias": allopathy_alias}
 
-    # Step 3: Create Reasoning Agent (collaborator)
+    # Step 4: Create Research Agent (new — V5)
+    research_id = create_agent(
+        "ausadhi-research-agent",
+        RESEARCH_INSTRUCTION,
+        MODELS["research"],
+    )
+    add_action_group(research_id, "ResearchToolsGroup", LAMBDA_ARNS["research_tools"],
+                     RESEARCH_FUNCTIONS, "PubMed/academic clinical evidence search")
+
+    if not prepare_agent(research_id):
+        print("FATAL: Research agent preparation failed")
+        sys.exit(1)
+    research_alias = create_alias(research_id)
+    results["research"] = {"id": research_id, "alias": research_alias}
+
+    # Step 5: Create Reasoning Agent (collaborator)
     reasoning_id = create_agent(
         "ausadhi-reasoning-agent",
         REASONING_INSTRUCTION,
         MODELS["reasoning"],
     )
     add_action_group(reasoning_id, "ReasoningToolsGroup", LAMBDA_ARNS["reasoning_tools"],
-                     REASONING_FUNCTIONS, "Severity scoring, KG, response formatting")
+                     REASONING_FUNCTIONS, "Severity scoring, KG, response formatting, schema validation")
     add_action_group(reasoning_id, "WebSearchGroup", LAMBDA_ARNS["web_search"],
-                     WEB_SEARCH_FUNCTIONS, "Web search via Tavily API")
+                     WEB_SEARCH_FUNCTIONS, "Web search via Tavily API with domain restriction")
 
     if not prepare_agent(reasoning_id):
         print("FATAL: Reasoning agent preparation failed")
@@ -513,7 +801,7 @@ def main():
     reasoning_alias = create_alias(reasoning_id)
     results["reasoning"] = {"id": reasoning_id, "alias": reasoning_alias}
 
-    # Step 4: Create Supervisor Agent
+    # Step 6: Create Supervisor Agent
     supervisor_id = create_agent(
         "ausadhi-supervisor-agent",
         SUPERVISOR_INSTRUCTION,
@@ -523,7 +811,13 @@ def main():
     add_action_group(supervisor_id, "CuratedDBGroup", LAMBDA_ARNS["check_curated_db"],
                      CURATED_DB_FUNCTIONS, "Curated interaction database lookup")
 
-    # Step 5: Associate collaborators with supervisor
+    # Step 7: Associate collaborators with supervisor
+    associate_collaborator(
+        supervisor_id, planner_id, planner_alias,
+        "Planner_Agent",
+        "Route to this agent to validate inputs and generate an execution plan. "
+        "This agent validates AYUSH plant existence in DynamoDB and returns a structured plan JSON.",
+    )
     associate_collaborator(
         supervisor_id, ayush_id, ayush_alias,
         "AYUSH_Agent",
@@ -539,14 +833,21 @@ def main():
         "drug class information.",
     )
     associate_collaborator(
+        supervisor_id, research_id, research_alias,
+        "Research_Agent",
+        "Route to this agent when you need peer-reviewed clinical evidence about "
+        "drug interactions from PubMed, Cochrane, and academic sources. This agent "
+        "searches domain-restricted academic databases only.",
+    )
+    associate_collaborator(
         supervisor_id, reasoning_id, reasoning_alias,
         "Reasoning_Agent",
-        "Route to this agent AFTER gathering data from both AYUSH_Agent and "
-        "Allopathy_Agent. This agent analyzes interaction potential, calculates "
-        "severity, builds knowledge graphs, and formats the final professional response.",
+        "Route to this agent AFTER gathering data from AYUSH_Agent, Allopathy_Agent, "
+        "and Research_Agent. This agent analyzes interaction potential, calculates "
+        "severity, builds knowledge graphs, validates output schema, and formats the final JSON response.",
     )
 
-    # Step 6: Prepare supervisor
+    # Step 8: Prepare supervisor
     if not prepare_agent(supervisor_id):
         print("FATAL: Supervisor agent preparation failed")
         sys.exit(1)
@@ -555,14 +856,17 @@ def main():
 
     # Summary
     print(f"\n{'='*60}")
-    print("AushadhiMitra Agent Setup Complete!")
+    print("AushadhiMitra V5 Agent Setup Complete!")
     print(f"{'='*60}")
     for role, info in results.items():
         print(f"  {role:15s}: Agent={info['id']}, Alias={info['alias']}")
 
+    print(f"\n  Planner Agent ID:  {results['planner']['id']}")
+    print(f"  Research Agent ID: {results['research']['id']}")
+    print(f"  Research Agent Alias: {results['research']['alias']}")
     print(f"\n  Supervisor Agent ID: {results['supervisor']['id']}")
     print(f"  Supervisor Alias ID: {results['supervisor']['alias']}")
-    print("\nUse these IDs in the EC2 backend and Telegram Lambda configuration.")
+    print("\nUse these IDs in the EC2 backend and docker-compose.yml configuration.")
 
     return results
 

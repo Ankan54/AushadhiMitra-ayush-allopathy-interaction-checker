@@ -6,6 +6,7 @@ Functions: web_search
 Uses Tavily Search API for drug interaction research.
 Returns full source metadata (URL, title, snippet, score) for transparency.
 Sources are categorized by type (pubmed, admet, clinical_trial, etc.) for UI display.
+Supports domain restriction via include_domains or domain_preset from S3 config.
 """
 import json
 import sys
@@ -28,9 +29,13 @@ TAVILY_SECRET_ARN = os.environ.get(
     "TAVILY_SECRET_NAME", "ausadhi-mitra/tavily-api-key"
 )
 TAVILY_API_URL = "https://api.tavily.com/search"
+S3_BUCKET = os.environ.get("S3_BUCKET", "ausadhi-mitra-667736132441")
 
 secrets_client = boto3.client("secretsmanager")
+s3 = boto3.client("s3")
+
 _tavily_key_cache = None
+_domain_config_cache = None
 
 SOURCE_CATEGORIES = [
     ("pubmed", ["pubmed.ncbi.nlm.nih.gov", "ncbi.nlm.nih.gov/pubmed"]),
@@ -45,7 +50,7 @@ SOURCE_CATEGORIES = [
                             "nccih.nih.gov", "ayush.gov.in"]),
     ("medical_reference", ["webmd.com", "mayoclinic.org", "medlineplus.gov",
                             "msdmanuals.com", "uptodate.com"]),
-    ("herbal_database", ["examine.com", "herbalgram.org", "https://cb.imsc.res.in/imppat/https://cb.imsc.res.in/imppat/",
+    ("herbal_database", ["examine.com", "herbalgram.org", "cb.imsc.res.in",
                          "consumerlab.com", "naturalstandard.com"]),
 ]
 
@@ -63,10 +68,17 @@ def lambda_handler(event, context):
                 max_results = int(params.get("max_results", "5"))
             except (ValueError, TypeError):
                 max_results = 5
+
+            include_domains_param = params.get("include_domains")
+            domain_preset = params.get("domain_preset")
+
+            resolved_domains = _resolve_domains(include_domains_param, domain_preset)
+
             result = web_search(
                 params.get("query", ""),
                 params.get("search_depth", "advanced"),
                 max_results,
+                include_domains=resolved_domains,
             )
         else:
             result = {"error": f"Unknown function: {function}"}
@@ -75,6 +87,44 @@ def lambda_handler(event, context):
         result = {"error": str(e)}
 
     return bedrock_response(action_group, function, result)
+
+
+def _load_domain_config() -> dict:
+    """Load domain preset config from S3, cached in module global."""
+    global _domain_config_cache
+    if _domain_config_cache is not None:
+        return _domain_config_cache
+    try:
+        resp = s3.get_object(Bucket=S3_BUCKET, Key="reference/search_domains.json")
+        _domain_config_cache = json.loads(resp["Body"].read().decode("utf-8"))
+        logger.info("Loaded domain config from S3")
+        return _domain_config_cache
+    except Exception as e:
+        logger.warning(f"Could not load search_domains.json from S3: {e}. Using empty config.")
+        _domain_config_cache = {"version": "1.0", "presets": {}}
+        return _domain_config_cache
+
+
+def _resolve_domains(include_domains_param: str, domain_preset: str) -> list:
+    """Resolve domain list from preset name or explicit include_domains param."""
+    if domain_preset:
+        config = _load_domain_config()
+        preset = config.get("presets", {}).get(domain_preset, {})
+        domains = preset.get("include_domains", [])
+        if domains:
+            logger.info(f"Using domain preset '{domain_preset}': {len(domains)} domains")
+            return domains
+
+    if include_domains_param:
+        try:
+            parsed = json.loads(include_domains_param)
+            if isinstance(parsed, list):
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return [d.strip() for d in include_domains_param.split(",") if d.strip()]
+
+    return []
 
 
 def _get_tavily_key() -> str:
@@ -118,24 +168,32 @@ def _categorize_source(url: str, title: str, snippet: str) -> str:
     return "general"
 
 
-def web_search(query: str, search_depth: str = "basic", max_results: int = 5) -> dict:
+def web_search(query: str, search_depth: str = "basic", max_results: int = 5,
+               include_domains: list = None) -> dict:
     """Search the web using Tavily API for drug interaction data.
 
     Returns structured results with full source metadata and category labels.
+    Optionally restricts search to specific domains via include_domains list.
     """
     if not query:
         return {"success": False, "message": "query is required"}
 
     api_key = _get_tavily_key()
 
-    payload = json.dumps({
+    payload_data = {
         "api_key": api_key,
         "query": query,
         "search_depth": search_depth,
         "max_results": max_results,
         "include_answer": True,
         "include_raw_content": False,
-    }).encode("utf-8")
+    }
+
+    if include_domains:
+        payload_data["include_domains"] = include_domains
+        logger.info(f"Restricting search to {len(include_domains)} domains")
+
+    payload = json.dumps(payload_data).encode("utf-8")
 
     req = Request(
         TAVILY_API_URL,
@@ -179,4 +237,5 @@ def web_search(query: str, search_depth: str = "basic", max_results: int = 5) ->
         "sources": sources,
         "total_results": len(sources),
         "source_categories": categories_found,
+        "domain_restricted": bool(include_domains),
     }

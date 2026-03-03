@@ -24,6 +24,8 @@ def get_pool():
             host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
             user=DB_USER, password=DB_PASSWORD, sslmode=DB_SSL,
             cursor_factory=psycopg2.extras.RealDictCursor,
+            connect_timeout=5,  # 5 second timeout
+            options="-c statement_timeout=5000",
         )
     return _pool
 
