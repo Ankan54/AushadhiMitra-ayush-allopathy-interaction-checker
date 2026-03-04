@@ -121,7 +121,14 @@ def _load_nti_ref() -> dict:
 
 def build_knowledge_graph(ayush_name: str, allopathy_name: str,
                           interactions_data_str: str) -> dict:
-    """Build a Cytoscape.js-compatible knowledge graph for the drug interaction."""
+    """Build an ADMET-focused Cytoscape.js knowledge graph with CYP enzyme overlap.
+
+    Graph structure:
+      - Drug nodes (Ayush, Allopathy)
+      - ADMET property nodes (Absorption, Distribution, Metabolism, Excretion, Toxicity)
+        for each drug
+      - CYP enzyme nodes connected to both drugs' Metabolism nodes (overlap highlighted)
+    """
     try:
         interactions = json.loads(interactions_data_str) if isinstance(interactions_data_str, str) else interactions_data_str
     except (json.JSONDecodeError, TypeError):
@@ -132,61 +139,123 @@ def build_knowledge_graph(ayush_name: str, allopathy_name: str,
     nodes = []
     edges = []
 
+    ayush_short = ayush_name.split()[0] if ayush_name else "AYUSH"
+    allo_short = allopathy_name.split()[0] if allopathy_name else "Allopathy"
+
+    # Drug nodes
     nodes.append({"data": {"id": "ayush", "label": ayush_name, "type": "ayush_plant"}})
     nodes.append({"data": {"id": "allopathy", "label": allopathy_name, "type": "allopathy_drug"}})
 
+    # ADMET property nodes — prefixed with drug name so they're distinguishable
+    ayush_admet = interactions.get("ayush_admet", {})
+    if not isinstance(ayush_admet, dict):
+        ayush_admet = {}
+    allo_admet = interactions.get("allopathy_admet", {})
+    if not isinstance(allo_admet, dict):
+        allo_admet = {}
+
+    for cat in ["Absorption", "Distribution", "Metabolism", "Excretion", "Toxicity"]:
+        cat_key = cat.lower()
+
+        ayush_val = ayush_admet.get(cat_key, "")
+        ayush_node_id = f"ayush_{cat_key}"
+        ayush_label = f"{ayush_short}: {cat}"
+        if ayush_val:
+            ayush_label += f" ({str(ayush_val)[:50]})"
+        nodes.append({"data": {"id": ayush_node_id, "label": ayush_label, "type": "admet_property"}})
+        edges.append({"data": {"source": "ayush", "target": ayush_node_id, "label": f"has {cat}"}})
+
+        allo_val = allo_admet.get(cat_key, "")
+        allo_node_id = f"allo_{cat_key}"
+        allo_label = f"{allo_short}: {cat}"
+        if allo_val:
+            allo_label += f" ({str(allo_val)[:50]})"
+        nodes.append({"data": {"id": allo_node_id, "label": allo_label, "type": "admet_property"}})
+        edges.append({"data": {"source": "allopathy", "target": allo_node_id, "label": f"has {cat}"}})
+
+    # Collect CYP enzymes from all available data sources
+    ayush_cyps = {}   # enzyme_name -> effect
+    allo_cyps = {}    # enzyme_name -> effect
+
+    # Ayush CYP effects: from phytochemical data or explicit ayush_cyp_enzymes
     phytochemicals = interactions.get("phytochemicals", [])
     if isinstance(phytochemicals, list):
-        for i, phyto in enumerate(phytochemicals[:10]):
-            name = phyto if isinstance(phyto, str) else phyto.get("name", f"phyto_{i}")
-            confidence = "" if isinstance(phyto, str) else phyto.get("confidence", "")
-            node_id = f"phyto_{i}"
-            nodes.append({"data": {"id": node_id, "label": name, "type": "phytochemical"}})
-            edges.append({
-                "data": {"source": "ayush", "target": node_id, "label": "contains"}
-            })
+        for phyto in phytochemicals:
+            if isinstance(phyto, dict):
+                for cyp_info in phyto.get("affected_enzymes", phyto.get("cyp_enzymes", [])):
+                    if isinstance(cyp_info, str):
+                        ayush_cyps.setdefault(cyp_info, "Affects")
+                    elif isinstance(cyp_info, dict):
+                        name = cyp_info.get("name", "")
+                        effect = cyp_info.get("effect", "Affects")
+                        if name:
+                            ayush_cyps[name] = effect
 
+    for e in interactions.get("ayush_cyp_enzymes", []):
+        if isinstance(e, str):
+            ayush_cyps.setdefault(e, "Affects")
+        elif isinstance(e, dict):
+            name = e.get("name", "")
+            if name:
+                ayush_cyps[name] = e.get("effect", "Affects")
+
+    # Allopathy CYP enzymes: from cyp_enzymes list or explicit allopathy_cyp_enzymes
     cyp_enzymes = interactions.get("cyp_enzymes", [])
     if isinstance(cyp_enzymes, list):
-        for i, enzyme in enumerate(cyp_enzymes[:8]):
-            name = enzyme if isinstance(enzyme, str) else enzyme.get("name", f"cyp_{i}")
-            effect = "" if isinstance(enzyme, str) else enzyme.get("effect", "")
-            confidence = "" if isinstance(enzyme, str) else enzyme.get("confidence", "")
-            node_id = f"cyp_{i}"
-            nodes.append({"data": {"id": node_id, "label": name, "type": "cyp_enzyme"}})
-            edge_label = f"metabolized by"
-            if confidence:
-                edge_label = f"metabolized by [{confidence.upper()}]"
-            edges.append({
-                "data": {"source": "allopathy", "target": node_id, "label": edge_label}
-            })
-            for phyto_node in nodes:
-                if phyto_node["data"].get("type") == "phytochemical":
-                    if effect:
-                        effect_label = f"inhibits" if "inhib" in effect.lower() else effect
-                        if confidence:
-                            effect_label = f"{effect_label} [{confidence.upper()}]"
-                        edges.append({
-                            "data": {
-                                "source": phyto_node["data"]["id"],
-                                "target": node_id,
-                                "label": effect_label,
-                            }
-                        })
+        for enzyme in cyp_enzymes:
+            if isinstance(enzyme, str):
+                allo_cyps.setdefault(enzyme, "Metabolized by")
+            elif isinstance(enzyme, dict):
+                name = enzyme.get("name", "")
+                if name:
+                    allo_cyps[name] = enzyme.get("effect", "Metabolized by")
 
-    mechanisms = interactions.get("mechanisms", [])
-    if isinstance(mechanisms, list):
-        for i, mech in enumerate(mechanisms[:5]):
-            name = mech if isinstance(mech, str) else mech.get("mechanism", f"mech_{i}")
-            node_id = f"mech_{i}"
-            nodes.append({"data": {"id": node_id, "label": name, "type": "mechanism"}})
+    for e in interactions.get("allopathy_cyp_enzymes", []):
+        if isinstance(e, str):
+            allo_cyps.setdefault(e, "Metabolized by")
+        elif isinstance(e, dict):
+            name = e.get("name", "")
+            if name:
+                allo_cyps[name] = e.get("effect", "Metabolized by")
 
-    clinical = interactions.get("clinical_effects", [])
-    if isinstance(clinical, list):
-        for i, effect in enumerate(clinical[:5]):
-            name = effect if isinstance(effect, str) else effect.get("effect", f"effect_{i}")
-            node_id = f"effect_{i}"
-            nodes.append({"data": {"id": node_id, "label": name, "type": "clinical_effect"}})
+    # If no explicit Ayush CYP data, treat all listed CYP enzymes as shared
+    # (they represent the interaction point between both drugs)
+    if not ayush_cyps and allo_cyps:
+        for name, effect in allo_cyps.items():
+            ayush_cyps[name] = "Inhibits" if "inhib" in effect.lower() else "Affects"
+
+    all_cyps = set(ayush_cyps.keys()) | set(allo_cyps.keys())
+    overlap_cyps = set(ayush_cyps.keys()) & set(allo_cyps.keys())
+
+    for enzyme_name in sorted(all_cyps):
+        is_overlap = enzyme_name in overlap_cyps
+        node_type = "cyp_enzyme_overlap" if is_overlap else "cyp_enzyme"
+        safe_id = enzyme_name.replace(" ", "_").replace("/", "_")
+        node_id = f"cyp_{safe_id}"
+
+        nodes.append({"data": {"id": node_id, "label": enzyme_name, "type": node_type}})
+
+        if enzyme_name in ayush_cyps:
+            raw_effect = ayush_cyps[enzyme_name]
+            if "inhib" in raw_effect.lower():
+                label = "Inhibits"
+            elif "induc" in raw_effect.lower():
+                label = "Induces"
+            else:
+                label = "Affects"
+            edges.append({"data": {"source": "ayush_metabolism", "target": node_id, "label": label}})
+
+        if enzyme_name in allo_cyps:
+            raw_effect = allo_cyps[enzyme_name]
+            if "metaboli" in raw_effect.lower():
+                label = "Metabolized by"
+            elif "inhib" in raw_effect.lower():
+                label = "Inhibits"
+            elif "induc" in raw_effect.lower():
+                label = "Induces"
+            else:
+                label = "Metabolized by"
+            edges.append({"data": {"source": "allo_metabolism", "target": node_id, "label": label}})
 
     return {
         "success": True,

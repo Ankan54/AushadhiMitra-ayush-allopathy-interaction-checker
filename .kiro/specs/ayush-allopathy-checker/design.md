@@ -2,94 +2,99 @@
 
 ## Overview
 
-AushadhiMitra is a multi-agent AI system that checks for drug interactions between AYUSH (traditional Indian medicine) and allopathic (modern pharmaceutical) medicines. The system uses **Amazon Bedrock Agents with Bedrock Flow V4** to orchestrate a tiered, self-validating pipeline: instant responses from a PostgreSQL curated database for high-impact pairs (Layer 0), and real-time multi-agent analysis with a DoWhile validation loop for other queries. A Pipeline Mode fallback handles Bedrock Flow timeouts.
+AushadhiMitra is a multi-agent AI system that checks for drug interactions between AYUSH (traditional Indian medicine) and allopathic (modern pharmaceutical) medicines. The system uses a **CO-MAS (Cooperative Multi-Agent System) pipeline** orchestrated directly by the FastAPI backend — five specialized AWS Bedrock Agents collaborate across up to 3 self-improving iterations to gather evidence, reason over it, and produce a structured interaction analysis.
 
-The backend is a **FastAPI application** with WebSocket streaming, deployed on Docker + Nginx. AWS Lambda functions serve as Action Groups for all deterministic operations. A dynamic JSON knowledge graph maps interaction pathways and is rendered on the frontend via Cytoscape.js.
+A tiered response strategy is used: instant responses from a PostgreSQL curated database (Layer 0) for known high-impact pairs, and real-time CO-MAS analysis for novel queries. Results are streamed to the frontend via WebSocket and rendered in a tabbed React UI with an ADMET-focused Cytoscape.js knowledge graph.
 
 **Key Design Principles:**
-- **AWS Managed Services**: Bedrock Agents, Bedrock Flows, Lambda, S3, DynamoDB, RDS PostgreSQL
-- **Bedrock Flow V4 + DoWhile**: Self-validating agent loop (max 3 iterations) with inline validation parser
-- **Pipeline Fallback**: FastAPI-orchestrated direct agent invocation when Flow times out
-- **Tiered Response**: Layer 0 (curated instant, <500ms) → Real-time multi-agent analysis → Graceful degradation
-- **Grounded Reasoning**: LLM uses ONLY provided evidence from Lambda data sources
-- **WebSocket Streaming**: Real-time agent trace events streamed to frontend
-- **Full Source Citation**: Clickable URLs for every claim (PubMed, DrugBank, IMPPAT, Tavily)
+- **CO-MAS Orchestration**: FastAPI orchestrates all 5 agents directly — no Bedrock Flows or DoWhile nodes
+- **Iterative Self-Improvement**: Deterministic Scorer identifies gaps; Planner adapts its plan each iteration
+- **Pipeline Memory**: What worked in iteration N is passed to the Planner in iteration N+1 to avoid redundant re-fetching
+- **ADMET Knowledge Graph**: Both drugs visualized with Absorption/Distribution/Metabolism/Excretion/Toxicity nodes; CYP overlaps highlighted
+- **Two-Stage Severity**: CYP-based Lambda scoring + pharmacodynamic boost from agent text evidence
+- **Full Source Traceability**: URLs extracted from all agent traces and response text; rendered as clickable links
+- **WebSocket Streaming**: Every agent action streamed in real time to the frontend
 
 **Architecture Summary:**
-- **1 Planner Agent** (Claude 3 Sonnet): Routes requests, checks curated DB
-- **3 Collaborator Agents**: AYUSH Agent (Claude 3 Haiku), Allopathy Agent (Claude 3 Haiku), Reasoning Agent (Claude 3 Sonnet)
-- **12 Lambda Action Groups**: Deterministic business logic functions
+- **5 Bedrock Agents**: Planner (Claude 3 Sonnet), AYUSH (Claude 3 Haiku), Allopathy (Claude 3 Haiku), Research (Claude 3 Haiku), Reasoning (Claude 3 Sonnet)
+- **7 Lambda Functions**: Deterministic tool implementations
 - **Data Storage**: S3 (reference data), DynamoDB (IMPPAT phytochemicals), RDS PostgreSQL (curated DB + allopathy cache)
-- **FastAPI Backend**: REST + WebSocket API, Docker + Nginx deployment
+- **FastAPI Backend**: `POST /api/check` + `WS /ws/{session_id}`, Docker + Nginx on EC2
 
 ---
 
-## AWS Architecture
+## System Architecture
 
-### System Architecture Diagram
+### Architecture Diagram
 
 ```
-User (Browser/Chat)
-        │
-        ▼
-[FastAPI + Nginx (Docker on EC2)]
-   REST POST /api/check-interaction
-   WS   /ws/check-interaction  ◄── Real-time trace streaming
-        │
-        ▼
-[agent_service.py]
-   ├─ mode=flow → Bedrock Flow V4 (DoWhile)
-   └─ mode=pipeline (fallback) → Direct agent invocation
-        │
-        ▼
-[Amazon Bedrock Flow V4]
-   ┌────────────────────────────────────────────────────────┐
-   │  FlowInput                                             │
-   │     ↓                                                  │
-   │  PlannerAgent (Claude 3 Sonnet)                        │
-   │     ├─ identify_substances() Lambda                    │
-   │     ├─ check_curated_interaction() Lambda ──► Layer 0  │
-   │     │        (PostgreSQL hit → instant return)         │
-   │     └─ Cache miss → enter DoWhile loop                 │
-   │                                                        │
-   │  DoWhile Loop (max 3 iterations)                       │
-   │  ┌──────────────────────────────────────────────────┐  │
-   │  │  AYUSHAgent (Claude 3 Haiku)                     │  │
-   │  │     ├─ ayush_name_resolver() Lambda              │  │
-   │  │     ├─ imppat_lookup() Lambda (DynamoDB)         │  │
-   │  │     └─ search_cyp_interactions() Lambda (Tavily) │  │
-   │  │                    +                             │  │
-   │  │  AllopathyAgent (Claude 3 Haiku)                 │  │
-   │  │     ├─ allopathy_cache_lookup() Lambda (PG)      │  │
-   │  │     ├─ web_search() Lambda (Tavily)              │  │
-   │  │     ├─ check_nti_status() Lambda                 │  │
-   │  │     └─ allopathy_cache_save() Lambda (PG)        │  │
-   │  │                    ↓                             │  │
-   │  │  DataMergePrompt (Amazon Nova Pro)               │  │
-   │  │     └─ Consolidate AYUSH + Allopathy data        │  │
-   │  │                    ↓                             │  │
-   │  │  ReasoningAgent (Claude 3 Sonnet)                │  │
-   │  │     ├─ build_knowledge_graph() Lambda            │  │
-   │  │     ├─ web_search() Lambda (research articles)   │  │
-   │  │     ├─ calculate_severity() Lambda               │  │
-   │  │     └─ format_professional_response() Lambda     │  │
-   │  │                    ↓                             │  │
-   │  │  ValidationParser (inline code node)            │  │
-   │  │     └─ Extract validation_status from output     │  │
-   │  │                    ↓                             │  │
-   │  │  ValidationLoopController                        │  │
-   │  │     ├─ PASSED → Exit DoWhile                     │  │
-   │  │     └─ NEEDS_MORE_DATA → Re-run loop (max 3x)    │  │
-   │  └──────────────────────────────────────────────────┘  │
-   │                    ↓                                    │
-   │  FlowOutput                                             │
-   └────────────────────────────────────────────────────────┘
-        │
-        ▼
-[FastAPI: format + stream response]
-        │
-        ▼
-[Frontend: Cytoscape.js KG + Severity + Sources + Disclaimer]
+User (Browser)
+      │
+      ▼
+[Nginx (port 80)] ──► [React SPA / static files]
+      │
+      ▼ /api/* and /ws/*
+[FastAPI backend (port 8000)]
+  ├─ POST /api/check  → start CO-MAS pipeline (returns session_id)
+  ├─ WS   /ws/{session_id} → stream real-time events
+  └─ GET  /api/health, /api/interactions
+      │
+      ▼
+[agent_service.py — CO-MAS Orchestrator]
+  │
+  ├─ Layer 0: lookup_curated(ayush, allopathy) → PostgreSQL
+  │     └─ Hit: return instantly (<500ms)
+  │
+  └─ Cache miss: CO-MAS Pipeline (max 3 iterations)
+       │
+       ▼
+  ┌─────────────────────────────────────────────────────┐
+  │  CO-MAS Iteration (repeated up to 3x)               │
+  │                                                     │
+  │  1. PLANNER PHASE                                   │
+  │     PlannerAgent (Claude 3 Sonnet)                  │
+  │       ├─ identify_substances() Lambda               │
+  │       ├─ check_curated_db() Lambda                  │
+  │       └─ create_execution_plan() Lambda             │
+  │     [Iter 2+: prompt includes pipeline memory       │
+  │      + remaining gaps, NOT the initial prompt]      │
+  │                                                     │
+  │  2. PROPOSER PHASE (parallel)                       │
+  │     AYUSHAgent (Claude 3 Haiku)                     │
+  │       ├─ ayush_name_resolver() Lambda               │
+  │       ├─ imppat_lookup() Lambda (DynamoDB)          │
+  │       └─ search_cyp_interactions() Lambda (Tavily)  │
+  │     AllopathyAgent (Claude 3 Haiku)                 │
+  │       ├─ allopathy_drug_lookup() Lambda             │
+  │       └─ check_nti_status() Lambda                  │
+  │     ResearchAgent (Claude 3 Haiku)                  │
+  │       └─ web_search() Lambda (Tavily/PubMed)        │
+  │                                                     │
+  │  3. EVALUATOR PHASE                                 │
+  │     ReasoningAgent (Claude 3 Sonnet)                │
+  │       ├─ build_knowledge_graph() Lambda             │
+  │       ├─ calculate_severity() Lambda                │
+  │       └─ web_search() Lambda (if more evidence      │
+  │          needed)                                    │
+  │                                                     │
+  │  4. SCORER PHASE (deterministic Python)             │
+  │     _score_output() → 0–100 score + gap list        │
+  │     _boost_severity_from_evidence() → PD boost      │
+  │     pipeline_memory updated with successes          │
+  │                                                     │
+  │  score ≥ 60 AND has_substance? → EXIT               │
+  │  else iteration < 3?           → NEXT ITERATION     │
+  │  else iteration == 3?          → EXIT (best effort) │
+  └─────────────────────────────────────────────────────┘
+      │
+      ▼
+  _format_final_json()
+  _extract_drugbank_url()
+  _extract_source_urls()
+  _transform_graph_to_admet()
+      │
+      ▼
+  WebSocket "complete" event → Frontend
 ```
 
 ---
@@ -99,38 +104,41 @@ User (Browser/Chat)
 ### Backend (FastAPI)
 
 **File: `backend/app/main.py`**
-- REST endpoint `POST /api/check-interaction`: Synchronous interaction check
-- WebSocket endpoint `WS /ws/check-interaction`: Streams agent trace events to frontend
-- `GET /api/health`: Returns system status, agent IDs, Flow ID, DB config
+- `POST /api/check`: Validates request (Pydantic), starts CO-MAS pipeline in background thread, returns `{session_id}`
+- `WS /ws/{session_id}`: Reads from session queue and streams pipeline events to the connected browser client
+- `GET /api/health`: Returns system status, agent IDs, DB config
 - `GET /api/interactions`: Lists recent 20 curated interactions from PostgreSQL
-- `GET /`: Serves React frontend static files
+- `GET /` and `GET /{path}`: Serves React SPA static files from `/app/static/`
 
 **File: `backend/app/agent_service.py`**
-- Orchestrates Bedrock Flow V4 or Pipeline Mode execution
-- Parses Bedrock Flow trace events for WebSocket streaming
-- Handles Flow timeout → automatic Pipeline Mode fallback
-- Supports `mode="auto|flow|pipeline"` parameter
+- `run_comas_pipeline()`: Main orchestrator — runs up to 3 CO-MAS iterations, manages pipeline memory, streams events to session queue
+- `_invoke_planner()`: Invokes Planner Agent with iteration-aware prompt (initial plan vs. gap-focused subsequent prompt)
+- `_invoke_proposers()`: Runs AYUSH, Allopathy, Research agents in parallel (ThreadPoolExecutor)
+- `_invoke_reasoning()`: Invokes Reasoning (Evaluator) Agent with merged proposer context
+- `_score_output()`: Deterministic scorer — awards 0–100 points across 8 dimensions; returns `(passes, gaps, score, evidence_quality)`
+- `_boost_severity_from_evidence()`: Scans agent response text for pharmacodynamic keywords; adds PD boost (capped at +25) to CYP base score
+- `_format_final_json()`: Assembles final `interaction_data` dict from agent outputs
+- `_extract_drugbank_url()`: Searches all traces + response text for DrugBank URL patterns
+- `_extract_source_urls()`: Parses URLs from all agent traces and responses; deduplicates into structured `sources` list
+- `_transform_graph_to_admet()`: Post-processes Lambda KG output to ensure ADMET nodes have drug-prefixed labels (e.g., "Curcuma: Metabolism") and edges use "has \<property\>" format
+- `_call_severity_lambda()`: Direct Lambda invocation fallback when the Reasoning Agent doesn't call `calculate_severity()`
 
 **File: `backend/app/config.py`**
-- Environment-based configuration for 4 agent IDs and aliases, Flow ID
-- PostgreSQL connection string, input validation rules
-- Agent model mapping (Sonnet for Planner/Reasoning, Haiku for AYUSH/Allopathy)
+- Environment-based configuration: 5 agent IDs + aliases, S3 bucket, PostgreSQL DSN
+- Agent model mapping (Sonnet for Planner/Reasoning, Haiku for AYUSH/Allopathy/Research)
+- `MAX_COMAS_ITERATIONS = 3`
 
 **File: `backend/app/db.py`**
 - PostgreSQL connection pool (psycopg2)
-- `lookup_curated(ayush_name, allopathy_name)` — Layer 0 instant response
-- `get_sources(interaction_key)` — Retrieve source URLs for curated interactions
+- `lookup_curated(ayush_name, allopathy_name)` — Layer 0 instant response using `response_data` column
+- `get_sources(interaction_key)` — Source URLs for curated interactions
 - `save_interaction(...)` — Persist new interaction results
 - `list_interactions()` — Returns 20 most recent interactions
 
-**File: `backend/app/models.py`**
-- Pydantic `InteractionRequest`: validates `ayush_medicine`, `allopathy_drug`, `user_type`
-- Pydantic `HealthResponse`: system status schema
-
 **Deployment:**
-- `Dockerfile`: Python 3.12-slim image
-- `docker-compose.yml`: FastAPI app + Nginx reverse proxy
-- `nginx.conf`: Reverse proxy config, static file serving
+- `Dockerfile`: Python 3.11-slim, installs requirements, copies all app files
+- `docker-compose.yml`: `aushadhi-comas:latest` app container (port 8000) + Nginx (port 80)
+- `nginx.conf`: Reverse proxy, WebSocket upgrade headers, static file serving
 
 ---
 
@@ -138,241 +146,304 @@ User (Browser/Chat)
 
 | Agent | Model | Role | Action Groups |
 |-------|-------|------|---------------|
-| **Planner Agent** | Claude 3 Sonnet | Entry point; identify substances, check curated DB | `planner_tools` |
-| **AYUSH Agent** | Claude 3 Haiku | Gather plant phytochemical + CYP data | `ayush_data`, `web_search` |
-| **Allopathy Agent** | Claude 3 Haiku | Gather drug CYP/metabolism data via cache + web | `allopathy_data`, `web_search` |
-| **Reasoning Agent** | Claude 3 Sonnet | Build KG, score severity, validate, format response | `reasoning_tools`, `web_search` |
+| **Planner** | Claude 3 Sonnet | Plan iteration; identify substances; check curated DB | `planner_tools` |
+| **AYUSH** | Claude 3 Haiku | Gather plant phytochemical + ADMET + CYP data | `ayush_data`, `web_search` |
+| **Allopathy** | Claude 3 Haiku | Gather drug ADMET, NTI status, DrugBank URL | `allopathy_data`, `web_search` |
+| **Research** | Claude 3 Haiku | Search PubMed and clinical evidence sources | `web_search`, `research_tools` |
+| **Reasoning** | Claude 3 Sonnet | Synthesize, build KG, score severity, format output | `reasoning_tools`, `web_search` |
+
+All agents use alias `TSTALIASID` (routes to latest DRAFT version).
 
 ---
 
 ### Lambda Action Groups
 
-#### `planner_tools/handler.py`
+#### `ausadhi-planner-tools`
 | Function | Input | Output |
 |----------|-------|--------|
-| `identify_substances` | Raw user text | `{ayush_medicine, allopathy_drug, confidence}` |
-| `check_curated_interaction` | ayush_name, allopathy_name | `{found: bool, response_data, knowledge_graph}` (uses `response_data` column) |
+| `identify_substances` | Raw query text | `{ayush_name, allopathy_name, confidence}` |
+| `check_curated_db` | ayush_name, allopathy_name | `{found: bool, response_data, knowledge_graph}` |
+| `create_execution_plan` | substances, gaps, iteration | `{plan_version, tasks[]}` |
 
-#### `ayush_data/handler.py`
+#### `ausadhi-ayush-data`
 | Function | Input | Output |
 |----------|-------|--------|
 | `ayush_name_resolver` | Common/brand name | `{scientific_name, common_names, key_phytochemicals}` |
 | `imppat_lookup` | scientific_name | `{phytochemicals[], admet_properties, cyp_effects}` from DynamoDB |
 | `search_cyp_interactions` | plant_name | `{cyp_interactions[], sources[]}` via Tavily |
 
-#### `allopathy_data/handler.py`
+#### `ausadhi-allopathy-data`
 | Function | Input | Output |
 |----------|-------|--------|
-| `allopathy_cache_lookup` | drug_name | `{found: bool, drug_data, sources[], cached_at}` |
-| `allopathy_cache_save` | drug_name, drug_data, sources | `{success: bool}` — 7-day TTL |
+| `allopathy_drug_lookup` | drug_name | `{drug_data, drugbank_url, admet_properties, sources[]}` |
 | `check_nti_status` | drug_name | `{is_nti: bool, clinical_concern, primary_cyp_substrates}` |
 
-#### `web_search/handler.py`
+#### `ausadhi-web-search`
 | Function | Input | Output |
 |----------|-------|--------|
 | `web_search` | query, max_results | `{results: [{url, title, snippet, category, score}]}` |
 
 Source categories: PubMed, DrugBank, FDA, research_paper, general
 
-#### `reasoning_tools/handler.py`
+#### `ausadhi-reasoning-tools`
 | Function | Input | Output |
 |----------|-------|--------|
-| `build_knowledge_graph` | ayush_data, allopathy_data | `{nodes[], edges[], overlap_nodes[]}` |
-| `calculate_severity` | interactions_data, is_nti | `{severity: NONE/MINOR/MODERATE/MAJOR, score: 0-100, factors[]}` |
-| `format_professional_response` | all_data | Full structured JSON response |
+| `build_knowledge_graph` | ayush_name, allopathy_name, interactions_data_str | `{nodes[], edges[]}` — ADMET + CYP overlap nodes |
+| `calculate_severity` | interactions_data_str, allopathy_name | `{severity, severity_score, is_nti, scoring_factors}` |
 
-#### `validation_parser/handler.py`
-- Inline code node in Bedrock Flow
-- Extracts `validation_status: PASSED | NEEDS_MORE_DATA` from Reasoning Agent output
-- Controls DoWhile loop exit condition
+#### `ausadhi-check-curated-db`
+- Provides `check_curated_db` as a callable action group tool for agents
+- Queries PostgreSQL `curated_interactions` table using `response_data` column
 
-#### Supporting Lambda Functions
-- `imppat_loader/handler.py`: Loads IMPPAT phytochemical records to DynamoDB `ausadhi-imppat`
-- `check_curated_db/handler.py`: Legacy S3-based curated check (replaced by PostgreSQL version)
-- `shared/bedrock_utils.py`, `shared/db_utils.py`: Shared utilities
+#### `ausadhi-research-tools`
+- Provides research-specific search capabilities (PubMed, clinical trial databases)
 
 ---
 
-### Data Architecture
+### Knowledge Graph Design
 
-#### PostgreSQL (RDS) — `aushadhimitra` database
-```
-curated_interactions
-  ├─ interaction_key       VARCHAR (PK, format: "ayush_name:allopathy_name")
-  ├─ ayush_name            VARCHAR
-  ├─ allopathy_name        VARCHAR
-  ├─ severity              VARCHAR (NONE/MINOR/MODERATE/MAJOR)
-  ├─ response_data         JSONB  ← NOTE: Lambda must use this column name
-  ├─ knowledge_graph       JSONB
-  └─ created_at            TIMESTAMP
+The knowledge graph is **ADMET-focused** — it shows the pharmacokinetic/toxicological profile of both drugs side by side, with CYP enzyme overlap nodes where the two drugs share the same metabolic pathway.
 
-interaction_sources
-  ├─ source_id             SERIAL (PK)
-  ├─ interaction_key       VARCHAR (FK → curated_interactions)
-  ├─ url                   TEXT
-  ├─ title                 TEXT
-  ├─ snippet               TEXT
-  └─ category              VARCHAR
+**Node types:**
 
-allopathy_cache
-  ├─ drug_name             VARCHAR (PK)
-  ├─ generic_name          VARCHAR
-  ├─ drug_data             JSONB
-  ├─ sources               JSONB
-  ├─ cached_at             TIMESTAMP
-  └─ expires_at            TIMESTAMP (TTL: 7 days)
-```
+| Type | Label Format | Color |
+|------|-------------|-------|
+| `ayush_plant` | Scientific name (e.g., "Curcuma longa") | Green |
+| `allopathy_drug` | Drug name (e.g., "Metformin") | Blue |
+| `admet_property` | "DrugShortName: Category" (e.g., "Curcuma: Metabolism") | Orange |
+| `cyp_enzyme_overlap` | Enzyme name (e.g., "CYP3A4") | Red (highlighted) |
+| `cyp_enzyme` | Enzyme name | Yellow |
 
-#### DynamoDB — `ausadhi-imppat` table
-```
-PK: plant_name (e.g., "curcuma_longa")
-SK: record_key ("METADATA" or "PHYTO#<imppat_id>")
+**Edge label format:**
+- Drug → ADMET node: `"has Absorption"`, `"has Metabolism"`, etc.
+- Drug → CYP node: `"Inhibits"`, `"Induces"`, `"Metabolized by"`
 
-METADATA record:
-  ├─ scientific_name, common_name, family
-  └─ phytochemical_count, last_updated
-
-PHYTO#<id> record:
-  ├─ phytochemical_name, plant_part, imppat_id
-  ├─ smiles, molecular_weight, drug_likeness
-  ├─ admet_properties (dict)
-  └─ cyp_interactions (inhibits[], induces[], substrates[])
-```
-
-#### S3 — `ausadhi-mitra-667736132441` bucket
-```
-/reference/name_mappings.json    — 5 AYUSH plants with scientific/common/Hindi/brand names
-/reference/cyp_enzymes.json      — 10 CYP450 enzymes with severity weights
-/reference/nti_drugs.json        — ~20 NTI drugs with clinical concerns
-```
-
----
-
-### Knowledge Graph Schema
-
+**Schema:**
 ```json
 {
   "nodes": [
-    {"id": "plant_1", "label": "Turmeric", "type": "Plant"},
-    {"id": "phyto_1", "label": "Curcumin", "type": "Phytochemical"},
-    {"id": "drug_1",  "label": "Warfarin",  "type": "Drug"},
-    {"id": "cyp_1",   "label": "CYP2C9",    "type": "CYP_Enzyme", "is_overlap": true},
-    {"id": "cyp_2",   "label": "CYP3A4",    "type": "CYP_Enzyme"}
+    {"data": {"id": "ayush", "label": "Curcuma longa", "type": "ayush_plant"}},
+    {"data": {"id": "allopathy", "label": "Metformin", "type": "allopathy_drug"}},
+    {"data": {"id": "ayush_absorption", "label": "Curcuma: Absorption", "type": "admet_property"}},
+    {"data": {"id": "allo_absorption", "label": "Metformin: Absorption", "type": "admet_property"}},
+    {"data": {"id": "ayush_metabolism", "label": "Curcuma: Metabolism", "type": "admet_property"}},
+    {"data": {"id": "allo_metabolism", "label": "Metformin: Metabolism", "type": "admet_property"}},
+    {"data": {"id": "cyp_CYP3A4", "label": "CYP3A4", "type": "cyp_enzyme_overlap"}}
   ],
   "edges": [
-    {"source": "plant_1",  "target": "phyto_1", "relationship": "CONTAINS"},
-    {"source": "phyto_1",  "target": "cyp_1",   "relationship": "INHIBITS"},
-    {"source": "drug_1",   "target": "cyp_1",   "relationship": "METABOLIZED_BY"}
-  ],
-  "overlap_nodes": ["cyp_1"],
-  "interaction_points": [
-    {"enzyme": "CYP2C9", "effect": "Curcumin inhibits; Warfarin substrate → increased Warfarin levels"}
+    {"data": {"source": "ayush", "target": "ayush_absorption", "label": "has Absorption"}},
+    {"data": {"source": "allopathy", "target": "allo_absorption", "label": "has Absorption"}},
+    {"data": {"source": "ayush", "target": "cyp_CYP3A4", "label": "Inhibits"}},
+    {"data": {"source": "allopathy", "target": "cyp_CYP3A4", "label": "Metabolized by"}}
   ]
 }
 ```
+
+**Post-processing (`_transform_graph_to_admet`):**
+After the Lambda returns the graph, the orchestrator applies label fixes:
+- ADMET nodes without drug-name prefix → prefixed with `"DrugShort: Category"`
+- Edge labels that are bare category names → prefixed with `"has "`
+- This ensures correct labeling even if the Lambda returned generic labels
 
 ---
 
 ### Severity Scoring Algorithm
 
+**Stage 1 — CYP-based (`calculate_severity` Lambda):**
 ```
-Base score: 0
+base_score = 0
 
-+ 15 points × (number of shared CYP enzymes)
-+ 25 points   (if allopathic drug is NTI)
-+ 20 points   (if clinical evidence: case report or study found)
-+ 15 points   (if pharmacodynamic overlap: shared effect category)
+For each CYP enzyme in interactions_data.cyp_enzymes:
+  weight = cyp_ref[enzyme].severity_weight  (from S3 cyp_enzymes.json)
+  if effect == inhibit/inhibitor:  base_score += weight × 2
+  elif effect == induce/inducer:   base_score += weight × 1.5
+  else:                            base_score += weight
 
-Score → Severity:
-  0–20  → NONE
-  21–40 → MINOR
-  41–60 → MODERATE
-  61+   → MAJOR
+if allopathy_drug in nti_drugs:    base_score += 25
+
+Thresholds (from cyp_enzymes.json):
+  NONE     < 15
+  MINOR    15–34
+  MODERATE 35–59
+  MAJOR    ≥ 60
 ```
+
+**Stage 2 — PD boost (`_boost_severity_from_evidence` in agent_service.py):**
+```
+Scan all agent response text for PD keyword groups (each group counts once):
+  - Hypoglycemic risk keywords → +8 to +10
+  - Synergistic/additive effect → +7 to +8
+  - AMPK pathway → +5
+  - Insulin sensitization → +5
+  - Potentiation → +7
+  - Bioavailability change → +6
+  - Hepatotoxicity / Nephrotoxicity → +6
+  - Bleeding / Anticoagulant → +7
+  ... etc.
+
+pd_boost = min(total_pd_points, 25)  ← hard cap
+
+final_score = min(cyp_base + pd_boost, 100)
+final_severity = reclassified by threshold
+```
+
+**Example (Turmeric + Metformin):**
+- Metformin is not NTI, not primarily CYP-metabolized → CYP base ≈ 15 (MINOR)
+- PD boost from "blood glucose"/"synergistic" keywords → +15 to +21
+- Final score: 30–36 → **MINOR to MODERATE** (varies by LLM response content)
 
 **Example (Turmeric + Warfarin):**
-- CYP2C9 overlap: +15
-- NTI (Warfarin): +25
-- Anticoagulant PD overlap: +15
-- Case report evidence: +20
-- Total: 75 → **MAJOR**
+- CYP2C9 overlap (weight×2): +20
+- NTI boost: +25
+- PD: anticoagulant synergy: +7
+- Total: 52+ → **MODERATE to MAJOR**
+
+---
+
+### Scorer (`_score_output`)
+
+Deterministic Python function awarding 0–100 points:
+
+| Dimension | Points | Pass Condition |
+|-----------|--------|----------------|
+| `ayush_name` present | 10 | Not None/empty |
+| `allopathy_name` present | 10 | Not None/empty |
+| Severity (not NONE, score > 0) | 20 | `severity != "NONE"` AND `severity_score > 0` |
+| Knowledge graph (≥ 3 nodes) | 10 | `len(nodes) >= 3` |
+| Sources (≥ 2) | 10 | `len(sources) >= 2` |
+| Mechanisms (PK or PD) | 10 | `pk or pd` non-empty |
+| Reasoning chain (≥ 2 steps) | 10 | `len(reasoning_chain) >= 2` |
+| Phytochemicals (≥ 1) | 10 | `len(phytochemicals) >= 1` |
+| Interaction summary (≥ 80 chars) | 10 | `len(summary) >= 80` |
+
+**Pass condition:**
+```python
+has_substance = bool(pk or pd or len(phytos) >= 1 or len(rc) >= 2)
+passes = (score >= 60 and has_substance) or iteration >= MAX_COMAS_ITERATIONS
+```
+
+---
+
+### Pipeline Memory
+
+Maintained as a per-session dict, updated after each scored iteration:
+
+```python
+pipeline_memory = {
+    "successes": [
+        "AYUSH drug identification confirmed: Curcuma longa",
+        "Found 3 phytochemicals (curcumin, demethoxycurcumin, bisdemethoxycurcumin)",
+        "Severity assessed as MODERATE (51/100)",
+        "KG built with 12 nodes"
+    ],
+    "data_collected": {
+        "ayush_name": "Curcuma longa",
+        "allopathy_name": "Metformin",
+        "phytochemicals": ["curcumin"],
+        "cyp_enzymes": ["CYP3A4"]
+    },
+    "source_urls": ["https://pubmed.ncbi.nlm.nih.gov/..."]
+}
+```
+
+Passed to the Planner in iteration N+1 as:
+```
+WHAT WORKED WELL (do NOT re-fetch):
+  - AYUSH drug identification confirmed: Curcuma longa
+  - Found 3 phytochemicals...
+
+REMAINING GAPS (focus on these):
+  - Need detailed reasoning chain with evidence (at least 2 steps)
+  - Need interaction summary (at least 80 characters)
+```
 
 ---
 
 ### WebSocket Streaming Protocol
 
 ```
-Client connects: WS /ws/check-interaction
-Client sends: {"ayush_medicine": "turmeric", "allopathy_drug": "warfarin", "user_type": "professional"}
+Client: POST /api/check  {"ayush_name": "Turmeric", "allopathy_name": "Metformin"}
+Server: {"session_id": "uuid"}
 
-Server streams events:
-  {"type": "status",         "message": "Starting interaction check..."}
-  {"type": "trace",          "message": "PlannerAgent: Identifying substances", "data": {...}}
-  {"type": "trace",          "message": "AYUSHAgent: Looking up IMPPAT data", "data": {...}}
-  {"type": "trace",          "message": "AllopathyAgent: Web search in progress", "data": {...}}
-  {"type": "agent_complete", "message": "ReasoningAgent: Analysis complete"}
-  {"type": "validation",     "message": "Validation: PASSED", "loop_iterations": 1}
-  {"type": "response_chunk", "message": "...response text chunk..."}
-  {"type": "complete",       "full_response": {...}, "execution_mode": "flow", "loop_iterations": 1, "final_validation": "PASSED"}
+Client: WS /ws/{session_id}
+
+Server streams:
+  {"type": "pipeline_status", "status": "name_resolution", "message": "Resolving 'Turmeric'..."}
+  {"type": "pipeline_status", "status": "iteration_start", "iteration": 1}
+  {"type": "pipeline_status", "status": "phase_proposer", "iteration": 1}
+  {"type": "llm_call",        "agent": "Planner", "iteration": 1}
+  {"type": "agent_thinking",  "agent": "Planner", "iteration": 1, "message": "..."}
+  {"type": "tool_call",       "agent": "Planner", "iteration": 1, "message": "Calling identify_substances"}
+  {"type": "tool_result",     "agent": "Planner", "iteration": 1, "message": "Tool returned: ..."}
+  {"type": "llm_response",    "agent": "Planner", "iteration": 1}
+  {"type": "agent_complete",  "agent": "Planner", "iteration": 1}
+  ...  (similar for AYUSH, Allopathy, Research, Reasoning agents)
+  {"type": "pipeline_status", "status": "phase_scorer", "iteration": 1}
+  {"type": "pipeline_status", "status": "gap_identified", "iteration": 1, "gap": "Need phytochemicals..."}
+  {"type": "pipeline_status", "status": "iteration_retry", "iteration": 1, "message": "Score=60. Retrying..."}
+  {"type": "pipeline_status", "status": "iteration_start", "iteration": 2}
+  ...
+  {"type": "pipeline_status", "status": "formatting", "message": "Formatting final output..."}
+  {"type": "complete", "result": { "status": "Success", "interaction_data": {...} }}
 ```
 
 ---
 
-### Professional Response Structure
+### Final Output Structure
+
+The `result` object in the `complete` WebSocket event:
 
 ```json
 {
-  "query": {"ayush_medicine": "...", "allopathy_drug": "..."},
-  "severity": {
-    "level": "MAJOR",
-    "score": 75,
-    "contributing_factors": ["CYP2C9 overlap", "NTI drug", "Anticoagulant PD overlap", "Case report evidence"]
-  },
-  "knowledge_graph": { "nodes": [...], "edges": [...], "overlap_nodes": [...] },
-  "mechanisms": [
-    {"type": "CYP", "enzyme": "CYP2C9", "effect": "Curcumin inhibits CYP2C9; Warfarin is CYP2C9 substrate → elevated Warfarin levels → bleeding risk"}
-  ],
-  "ayush_profile": {
-    "plant": "Curcuma longa",
-    "phytochemicals": ["Curcumin", "Demethoxycurcumin"],
-    "cyp_effects": ["CYP2C9 inhibitor", "CYP3A4 inhibitor"],
-    "sources": [{"url": "...", "title": "IMPPAT entry", "category": "database"}]
-  },
-  "allopathy_profile": {
-    "drug": "Warfarin",
-    "generic_name": "Warfarin sodium",
-    "is_nti": true,
-    "cyp_substrate": ["CYP2C9"],
-    "sources": [{"url": "...", "title": "DrugBank: Warfarin", "category": "DrugBank"}]
-  },
-  "research_citations": [
-    {"url": "https://pubmed.ncbi.nlm.nih.gov/...", "title": "Curcumin-warfarin interaction...", "category": "PubMed"}
-  ],
-  "conflicts": [],
-  "ai_summary": "Turmeric (Curcumin) significantly inhibits CYP2C9, the primary enzyme metabolizing Warfarin...",
-  "disclaimer": "This tool provides informational analysis only. Consult a licensed healthcare professional before making any medication decisions.",
-  "execution_mode": "flow",
-  "loop_iterations": 1
+  "status": "Success",
+  "interaction_data": {
+    "interaction_key": "curcuma_longa:metformin",
+    "ayush_name": "Curcuma longa",
+    "allopathy_name": "Metformin",
+    "interaction_exists": true,
+    "interaction_summary": "Curcumin from Curcuma longa may enhance metformin's glucose-lowering effect...",
+    "severity": "MODERATE",
+    "severity_score": 51,
+    "is_nti": false,
+    "scoring_factors": ["CYP3A4 interaction (+10)", "Blood glucose effect (+8)", "Synergistic effect (+7)"],
+    "mechanisms": {
+      "pharmacokinetic": [
+        {"mechanism": "CYP3A4 inhibition by curcumin", "evidence": "https://pubmed.ncbi.nlm.nih.gov/...", "confidence": "HIGH"}
+      ],
+      "pharmacodynamic": [
+        {"mechanism": "Additive glucose-lowering effect", "evidence": "AMPK pathway activation", "confidence": "MODERATE"}
+      ]
+    },
+    "phytochemicals_involved": ["curcumin", "demethoxycurcumin"],
+    "clinical_effects": ["Enhanced hypoglycemic effect", "Possible blood glucose reduction"],
+    "recommendations": ["Monitor blood glucose levels", "Consult physician before combining"],
+    "evidence_quality": "MODERATE",
+    "reasoning_chain": [
+      {"step": 1, "reasoning": "Curcumin is a known CYP3A4 inhibitor...", "evidence": "PubMed 29518605"},
+      {"step": 2, "reasoning": "Metformin activates AMPK; curcumin also activates AMPK...", "evidence": "In vitro studies"}
+    ],
+    "knowledge_graph": {
+      "nodes": [
+        {"data": {"id": "ayush", "label": "Curcuma longa", "type": "ayush_plant"}},
+        {"data": {"id": "allopathy", "label": "Metformin", "type": "allopathy_drug"}},
+        {"data": {"id": "ayush_metabolism", "label": "Curcuma: Metabolism", "type": "admet_property"}},
+        {"data": {"id": "allo_metabolism", "label": "Metformin: Metabolism", "type": "admet_property"}}
+      ],
+      "edges": [
+        {"data": {"source": "ayush", "target": "ayush_metabolism", "label": "has Metabolism"}},
+        {"data": {"source": "allopathy", "target": "allo_metabolism", "label": "has Metabolism"}}
+      ]
+    },
+    "sources": [
+      {"url": "https://pubmed.ncbi.nlm.nih.gov/29518605/", "title": "Curcumin and metformin interaction", "category": "PubMed"},
+      {"url": "https://go.drugbank.com/drugs/DB00331", "title": "Metformin — DrugBank", "category": "DrugBank"}
+    ],
+    "drugbank_url": "https://go.drugbank.com/drugs/DB00331",
+    "imppat_url": "https://imppat.iith.ac.in/...",
+    "disclaimer": "This tool provides informational analysis only. Consult a licensed healthcare professional before making any medication decisions.",
+    "generated_at": "2026-03-04T07:57:00Z"
+  }
 }
-```
-
----
-
-### Pipeline Fallback Mode
-
-When Bedrock Flow V4 times out (known issue), `agent_service.py` falls back to Pipeline Mode:
-
-```
-FastAPI agent_service.py (Pipeline Mode)
-  ↓
-invoke_agent(planner_agent_id, query)
-  ↓
-invoke_agent(ayush_agent_id, substances)       ─┐ parallel
-invoke_agent(allopathy_agent_id, substances)   ─┘
-  ↓
-invoke_agent(reasoning_agent_id, merged_data)
-  ↓
-Return formatted response
 ```
 
 ---
@@ -382,75 +453,77 @@ Return formatted response
 ```
 AWS Account: 667736132441  |  Region: us-east-1
 
-EC2 Instance
-  └─ Docker Compose
-       ├─ aushadhimitra-app (FastAPI, port 8000)
-       └─ aushadhimitra-nginx (Nginx, port 80/443)
+EC2 Instance: i-0dd48f5462906bc03  |  Public IP: 3.210.198.169
+  IAM Role: AusadhiEC2Role
+    └─ Permissions: bedrock:*, lambda:InvokeFunction, s3:*, logs:PutLogEvents
+  Docker Compose:
+    ├─ ausadhi-app   (aushadhi-comas:latest, port 8000) ← FastAPI
+    └─ ausadhi-nginx (nginx:alpine, port 80)            ← Reverse proxy
 
-AWS Services:
-  ├─ Bedrock Agents (4 agents: Planner, AYUSH, Allopathy, Reasoning)
-  ├─ Bedrock Flows (Flow V4 with DoWhile)
-  ├─ Lambda (12 functions, Python 3.12, us-east-1)
-  ├─ S3 Bucket: ausadhi-mitra-667736132441
-  ├─ DynamoDB: ausadhi-imppat
-  ├─ RDS PostgreSQL: scm-postgres.c2na6oc62pb7.us-east-1.rds.amazonaws.com:5432/aushadhimitra
-  └─ Secrets Manager: Tavily API key
+Bedrock Agents (us-east-1):
+  ├─ Planner:    JRARFMAC40 / TSTALIASID
+  ├─ AYUSH:      0SU1BHJ78L / TSTALIASID
+  ├─ Allopathy:  CNAZG8LA0H / TSTALIASID
+  ├─ Reasoning:  03NGZ4CNF3 / TSTALIASID
+  └─ Research:   7DCGAF6N1A / TSTALIASID
+
+Lambda Functions (us-east-1, Python 3.11):
+  ├─ ausadhi-planner-tools      (last deployed: 2026-03-04)
+  ├─ ausadhi-ayush-data         (last deployed: 2026-03-04)
+  ├─ ausadhi-allopathy-data     (last deployed: 2026-03-04)
+  ├─ ausadhi-web-search         (last deployed: 2026-03-04)
+  ├─ ausadhi-reasoning-tools    (last deployed: 2026-03-04)
+  ├─ ausadhi-check-curated-db   (last deployed: 2026-03-04)
+  └─ ausadhi-research-tools     (last deployed: 2026-03-03)
+
+S3: ausadhi-mitra-667736132441
+  ├─ /reference/name_mappings.json
+  ├─ /reference/cyp_enzymes.json
+  └─ /reference/nti_drugs.json
+
+DynamoDB: ausadhi-imppat
+  └─ Plants: curcuma_longa, glycyrrhiza_glabra, zingiber_officinale,
+             hypericum_perforatum, withania_somnifera
+
+RDS PostgreSQL: scm-postgres.c2na6oc62pb7.us-east-1.rds.amazonaws.com:5432/aushadhimitra
+  ├─ curated_interactions (response_data JSONB column)
+  ├─ interaction_sources
+  └─ allopathy_cache
 ```
 
 ### Deployment Scripts
+
 | Script | Purpose |
 |--------|---------|
-| `scripts/create_flow_v4.py` | Build Bedrock Flow V4 with DoWhile node |
-| `scripts/setup_agents.py` | Create/update 4 Bedrock agents with action groups |
-| `scripts/deploy_lambdas.sh` | Package and deploy Lambda functions |
+| `scripts/deploy_lambdas.sh` | Package and deploy all Lambda functions |
+| `scripts/setup_agents.py` | Create/update 5 Bedrock agents with action groups |
 | `scripts/imppat_pipeline.py` | Load IMPPAT CSV data to DynamoDB |
-| `scripts/plant_details_extractor.py` | Extract IMPPAT plant metadata |
-| `scripts/plant_specific_extractor.py` | Deep extract phytochemical data per plant |
+
+### Rebuilding the EC2 Docker Image
+
+Since the compose file uses `image: aushadhi-comas:latest` (pre-built tag), code changes require a manual rebuild:
+```bash
+# Via SSM (no SSH needed):
+cd /home/ec2-user/aushadhimitra
+docker build -t aushadhi-comas:latest .
+docker-compose down && docker-compose up -d
+```
 
 ---
 
-## Known Issues and Mitigations
+## Known Issues and Current Status
 
-| # | Issue | Impact | Mitigation |
-|---|-------|--------|-----------|
-| 1 | Bedrock Flow V4 timeout (Read timed out) | Flow execution fails | Auto-fallback to Pipeline Mode in `agent_service.py` |
-| 2 | Curated DB Lambda uses `interaction_data` column but DB has `response_data` | Layer 0 instant responses always fail; every query triggers full analysis | Fix Lambda to use `response_data` column |
-| 3 | `calculate_severity()` NoneType error when `interactions_data` is None | Severity Lambda crashes on null input | Add null guard: `if not interactions_data: return default_result` |
-| 4 | `db.py` backend vs Lambda schema alignment | Potential column name drift | Consolidate schema constants in `shared/db_utils.py` |
-| 5 | Empty `knowledge_graph` in some final responses | KG visualization fails silently | Ensure `build_knowledge_graph()` always returns a valid graph structure |
-
----
-
-## Data Flow: Example Query
-
-**Input:** "Check interaction between turmeric and warfarin" (user_type: professional)
-
-```
-1. FastAPI validates request (Pydantic)
-2. agent_service.py → attempt Bedrock Flow V4
-3. PlannerAgent:
-   - identify_substances() → {ayush: "Curcuma longa", allopathy: "Warfarin"}
-   - check_curated_interaction() → {found: false} [Issue #2: may fail]
-4. DoWhile Iteration 1:
-   a. AYUSHAgent:
-      - ayush_name_resolver("turmeric") → scientific_name: "Curcuma longa"
-      - imppat_lookup("Curcuma longa") → {Curcumin: CYP2C9/3A4 inhibitor, Demethoxycurcumin: ...}
-      - search_cyp_interactions("Curcuma longa") → Tavily results with PubMed links
-   b. AllopathyAgent:
-      - allopathy_cache_lookup("Warfarin") → {found: false} (first run)
-      - web_search("Warfarin CYP metabolism DrugBank") → {CYP2C9 substrate, NTI drug}
-      - check_nti_status("Warfarin") → {is_nti: true, clinical_concern: "Bleeding risk"}
-      - allopathy_cache_save("Warfarin", data) → cached for 7 days
-   c. DataMergePrompt (Nova Pro) → consolidated data object
-   d. ReasoningAgent:
-      - build_knowledge_graph() → {nodes: [Turmeric, Curcumin, Warfarin, CYP2C9], edges: [...], overlap: [CYP2C9]}
-      - web_search("Curcumin warfarin interaction PubMed") → research citations
-      - calculate_severity() → {score: 75, level: MAJOR, factors: [CYP2C9, NTI, PD, evidence]}
-      - format_professional_response() → full JSON
-      - validation_status: PASSED
-   e. ValidationParser → extract "PASSED"
-   f. Loop exits
-5. FlowOutput → FastAPI formats and streams response
-6. WebSocket: streams trace events → "complete" event with full_response JSON
-7. Frontend: renders Cytoscape.js graph + severity badge + source URLs + disclaimer
-```
+| # | Issue | Status | Resolution |
+|---|-------|--------|------------|
+| 1 | Bedrock Flow V4 timeout | Resolved | Replaced by CO-MAS direct orchestration — Flows no longer used |
+| 2 | Same error message in all iterations | Resolved | Planner uses gap-focused prompt in iteration N>1, not initial prompt |
+| 3 | Information gaps showing status=Failed in UI | Resolved | Gap events streamed as `pipeline_status(gap_identified)` separate from errors |
+| 4 | Severity showing NONE (0/100) | Resolved | Added direct `_call_severity_lambda()` fallback; fixed `_score_output` treating `0` as present |
+| 5 | DrugBank URL missing from Drug Info tab | Resolved | `_extract_drugbank_url()` searches all traces + agent response text |
+| 6 | Evidence mentions but no clickable links | Resolved | `TextWithLinks` React component auto-detects URLs in any text field |
+| 7 | KG showing "Contains" edges for AYUSH / "Induces" for allopathy | Resolved | `build_knowledge_graph()` Lambda now generates ADMET nodes; `_transform_graph_to_admet()` ensures prefix labels |
+| 8 | KG node and edge labels both named "Metabolism" etc. | Resolved | ADMET nodes prefixed: "Curcuma: Metabolism"; edges: "has Metabolism" |
+| 9 | Sources list empty | Resolved | `_extract_source_urls()` parses all agent traces and responses |
+| 10 | Pipeline not improving across iterations | Resolved | Pipeline memory passes successes + gaps to Planner each iteration |
+| 11 | Severity inconsistent (MINOR vs MAJOR across runs) | Known / Inherent | LLM non-determinism affects PD boost; CYP-base score is deterministic; acceptable variance |
+| 12 | EC2 image not updated on code change | Process | Must run `docker build` manually after deploying new files — compose uses pre-built `image:` tag |

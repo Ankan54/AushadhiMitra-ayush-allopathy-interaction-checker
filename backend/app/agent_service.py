@@ -414,27 +414,87 @@ def _parse_reasoning_output(reasoning_response: str, compile_result: dict = None
     return {}
 
 
-def _extract_drugbank_url(traces: list) -> str:
-    """Extract DrugBank URL from allopathy agent's tool result traces."""
+_DRUGBANK_URL_RE = re.compile(
+    r'https?://(?:go\.)?drugbank\.com/drugs/[A-Za-z0-9]+'
+)
+
+
+def _extract_drugbank_url(traces: list, response_text: str = "") -> str:
+    """Extract DrugBank URL from allopathy agent traces AND response text."""
+    # Search all trace types (tool results, thinking, model output, agent complete)
     for trace in traces:
-        if trace.get("type") == "tool_result":
-            full_result = trace.get("_full_result", "")
-            # Look for DrugBank URLs in the tool result text
-            match = re.search(
-                r'https?://(?:go\.)?drugbank\.com/drugs/[A-Za-z0-9]+',
-                full_result
-            )
-            if match:
-                return match.group(0)
+        for field in ("_full_result", "message", "response"):
+            text = trace.get(field, "")
+            if text:
+                match = _DRUGBANK_URL_RE.search(text)
+                if match:
+                    return match.group(0)
+
+    # Also search the agent's final response text
+    if response_text:
+        match = _DRUGBANK_URL_RE.search(response_text)
+        if match:
+            return match.group(0)
+
     return ""
+
+
+def _extract_source_urls(traces: list, response_text: str = "") -> list:
+    """Extract source URLs from agent traces and response text."""
+    url_re = re.compile(
+        r'https?://(?:pubmed\.ncbi\.nlm\.nih\.gov|'
+        r'www\.ncbi\.nlm\.nih\.gov/(?:pubmed|pmc)|'
+        r'(?:go\.)?drugbank\.com|'
+        r'cb\.imsc\.res\.in/imppat|'
+        r'examine\.com|'
+        r'scholar\.google\.com|'
+        r'clinicaltrials\.gov|'
+        r'www\.webmd\.com|'
+        r'www\.drugs\.com|'
+        r'doi\.org)'
+        r'[^\s"\',<>)\]]*'
+    )
+
+    seen = set()
+    sources = []
+
+    all_text = response_text or ""
+    for trace in traces:
+        for field in ("_full_result", "message", "response"):
+            text = trace.get(field, "")
+            if text:
+                all_text += "\n" + text
+
+    for match in url_re.finditer(all_text):
+        url = match.group(0).rstrip(".")
+        if url not in seen:
+            seen.add(url)
+            source_type = "research"
+            if "pubmed" in url or "ncbi" in url or "pmc" in url:
+                source_type = "PubMed"
+            elif "drugbank" in url:
+                source_type = "DrugBank"
+            elif "imppat" in url or "imsc.res.in" in url:
+                source_type = "IMPPAT"
+            elif "clinicaltrials" in url:
+                source_type = "ClinicalTrials"
+            elif "doi.org" in url:
+                source_type = "DOI"
+            sources.append({
+                "url": url,
+                "title": "",
+                "snippet": "",
+                "source_type": source_type,
+            })
+
+    return sources
 
 
 def _extract_allopathy_info(traces: list, allopathy_response: str) -> dict:
     """Extract allopathy drug info from agent traces and response."""
-    drugbank_url = _extract_drugbank_url(traces)
+    drugbank_url = _extract_drugbank_url(traces, allopathy_response)
     info = {"drugbank_url": drugbank_url}
 
-    # Try to parse JSON from response
     try:
         data = json.loads(allopathy_response)
         if isinstance(data, dict):
@@ -478,6 +538,126 @@ def _build_phytochemical_details(reasoning_output: dict) -> list:
     return interaction_data.get("phytochemicals_involved", [])
 
 
+def _transform_graph_to_admet(
+    graph: dict,
+    ayush_name: str,
+    allopathy_name: str,
+) -> dict:
+    """Post-process a knowledge graph into ADMET-focused format with CYP overlap.
+
+    - If graph already has admet_property nodes: fix labels (prefix with drug name)
+      and fix edge labels (use 'has X' instead of bare 'X').
+    - If old-style graph (phytochemicals with Contains): full transform.
+    """
+    if not isinstance(graph, dict):
+        return graph
+
+    nodes = graph.get("nodes", [])
+    edges = graph.get("edges", [])
+
+    if not nodes:
+        return graph
+
+    ayush_short = ayush_name.split()[0] if ayush_name else "AYUSH"
+    allo_short = allopathy_name.split()[0] if allopathy_name else "Allopathy"
+
+    admet_categories = {"absorption", "distribution", "metabolism", "excretion", "toxicity"}
+
+    # Check if graph already has ADMET nodes (from Lambda)
+    has_admet = any(
+        n.get("data", {}).get("type") == "admet_property" for n in nodes
+    )
+    if has_admet:
+        # Fix labels on existing ADMET graph: prefix with drug name, fix edge labels
+        for node in nodes:
+            nd = node.get("data", {})
+            if nd.get("type") != "admet_property":
+                continue
+            nid = nd.get("id", "")
+            label = nd.get("label", "")
+            # Only fix if the label is a bare category (no drug name prefix yet)
+            if label.lower() in admet_categories:
+                if nid.startswith("ayush_"):
+                    nd["label"] = f"{ayush_short}: {label}"
+                elif nid.startswith("allo_"):
+                    nd["label"] = f"{allo_short}: {label}"
+        for edge in edges:
+            ed = edge.get("data", {})
+            label = ed.get("label", "")
+            if label.lower() in admet_categories:
+                ed["label"] = f"has {label}"
+        return graph
+
+    # Transform old format → ADMET format
+    new_nodes = []
+    new_edges = []
+
+    # Drug nodes
+    new_nodes.append({"data": {"id": "ayush", "label": ayush_name, "type": "ayush_plant"}})
+    new_nodes.append({"data": {"id": "allopathy", "label": allopathy_name, "type": "allopathy_drug"}})
+
+    # ADMET property nodes — prefixed with drug name so they're distinguishable
+    for cat in ["Absorption", "Distribution", "Metabolism", "Excretion", "Toxicity"]:
+        cat_key = cat.lower()
+        ayush_node_id = f"ayush_{cat_key}"
+        new_nodes.append({"data": {
+            "id": ayush_node_id,
+            "label": f"{ayush_short}: {cat}",
+            "type": "admet_property",
+        }})
+        new_edges.append({"data": {"source": "ayush", "target": ayush_node_id, "label": f"has {cat}"}})
+
+        allo_node_id = f"allo_{cat_key}"
+        new_nodes.append({"data": {
+            "id": allo_node_id,
+            "label": f"{allo_short}: {cat}",
+            "type": "admet_property",
+        }})
+        new_edges.append({"data": {"source": "allopathy", "target": allo_node_id, "label": f"has {cat}"}})
+
+    # Collect CYP enzyme nodes from old graph
+    cyp_nodes = [n for n in nodes if n.get("data", {}).get("type") == "cyp_enzyme"]
+    cyp_names_seen = set()
+
+    for cyp_node in cyp_nodes:
+        enzyme_name = cyp_node["data"].get("label", "")
+        if not enzyme_name or enzyme_name in cyp_names_seen:
+            continue
+        cyp_names_seen.add(enzyme_name)
+
+        safe_id = enzyme_name.replace(" ", "_").replace("/", "_")
+        node_id = f"cyp_{safe_id}"
+
+        # All CYP enzymes in an interaction graph are overlap nodes
+        new_nodes.append({"data": {"id": node_id, "label": enzyme_name, "type": "cyp_enzyme_overlap"}})
+
+        # Find edges for this CYP enzyme from the old graph
+        old_id = cyp_node["data"]["id"]
+        ayush_effect = "Affects"
+        allo_effect = "Metabolized by"
+        for edge in edges:
+            ed = edge.get("data", {})
+            if ed.get("target") == old_id:
+                label = ed.get("label", "").lower()
+                source_type = None
+                for n in nodes:
+                    if n["data"]["id"] == ed.get("source"):
+                        source_type = n["data"].get("type")
+                        break
+                if source_type == "allopathy_drug":
+                    allo_effect = ed.get("label", "Metabolized by")
+                elif source_type in ("phytochemical", "ayush_plant"):
+                    if "inhib" in label:
+                        ayush_effect = "Inhibits"
+                    elif "induc" in label:
+                        ayush_effect = "Induces"
+
+        new_edges.append({"data": {"source": "ayush_metabolism", "target": node_id, "label": ayush_effect}})
+        new_edges.append({"data": {"source": "allo_metabolism", "target": node_id, "label": allo_effect}})
+
+    return {"nodes": new_nodes, "edges": new_edges}
+
+
 # ──────────────────────────────────────────────────────────────
 # CO-MAS Scorer Phase (deterministic)
 # ──────────────────────────────────────────────────────────────
@@ -488,27 +668,48 @@ def _score_output(reasoning_output: dict, iteration: int) -> Tuple[bool, list, f
     Returns: (passes, gaps, score, evidence_quality)
     """
     if not isinstance(reasoning_output, dict):
-        return False, ["No reasoning output produced"], 0.0, "LOW"
+        return False, [
+            "Need phytochemical data for the AYUSH drug with CYP enzyme interactions",
+            "Need CYP metabolism pathway data for the allopathy drug",
+            "Need clinical evidence from PubMed or research studies",
+        ], 0.0, "LOW"
 
     status = reasoning_output.get("status", "Failed")
     interaction_data = reasoning_output.get("interaction_data", {})
     if not isinstance(interaction_data, dict):
         interaction_data = {}
 
-    if status != "Success":
-        failure_reason = reasoning_output.get("failure_reason", "Unknown failure")
-        return False, [f"Status={status}: {failure_reason}"], 0.0, "LOW"
-
     score = 0.0
     gaps = []
 
+    if status != "Success":
+        # Still try to score partial data; generate specific actionable gaps
+        if not interaction_data:
+            return False, [
+                "Retrieve specific phytochemicals and their CYP enzyme effects for the AYUSH drug",
+                "Retrieve CYP450 metabolism pathways and NTI status for the allopathy drug",
+                "Search PubMed for clinical interaction evidence between these drugs",
+            ], 0.0, "LOW"
+        # Fall through to score whatever partial data exists
+
     # Required fields — 10 pts each
-    for field in ["ayush_name", "allopathy_name", "severity", "severity_score"]:
+    for field, description in [
+        ("ayush_name", "AYUSH drug scientific name"),
+        ("allopathy_name", "Allopathy drug name"),
+    ]:
         val = interaction_data.get(field)
         if val not in (None, "", [], {}):
             score += 10
         else:
-            gaps.append(f"Missing required field: {field}")
+            gaps.append(f"Need {description}")
+
+    # Severity — 10 pts (NONE doesn't count as meaningful)
+    severity_val = interaction_data.get("severity", "NONE")
+    severity_score_val = interaction_data.get("severity_score", 0)
+    if severity_val and severity_val != "NONE" and severity_score_val > 0:
+        score += 20
+    else:
+        gaps.append("Need severity assessment with CYP enzyme analysis or pharmacodynamic evidence")
 
     # Knowledge graph — 10 pts
     kg = interaction_data.get("knowledge_graph", {})
@@ -516,14 +717,14 @@ def _score_output(reasoning_output: dict, iteration: int) -> Tuple[bool, list, f
     if len(nodes) >= 3:
         score += 10
     else:
-        gaps.append("Knowledge graph insufficient (< 3 nodes)")
+        gaps.append("Need ADMET properties and CYP enzyme data for knowledge graph")
 
     # Sources — 10 pts
     sources = interaction_data.get("sources", [])
     if len(sources) >= 2:
         score += 10
     else:
-        gaps.append("Insufficient sources cited (< 2)")
+        gaps.append("Need at least 2 research sources (PubMed articles, clinical studies)")
 
     # Mechanisms — 10 pts
     mechanisms = interaction_data.get("mechanisms", {})
@@ -532,28 +733,28 @@ def _score_output(reasoning_output: dict, iteration: int) -> Tuple[bool, list, f
     if pk or pd:
         score += 10
     else:
-        gaps.append("No mechanisms described")
+        gaps.append("Need pharmacokinetic and pharmacodynamic mechanism details")
 
     # Reasoning chain — 10 pts
     rc = interaction_data.get("reasoning_chain", [])
     if len(rc) >= 2:
         score += 10
     else:
-        gaps.append("Reasoning chain absent or too short (< 2 steps)")
+        gaps.append("Need detailed reasoning chain with evidence (at least 2 steps)")
 
     # Phytochemicals — 10 pts
     phytos = interaction_data.get("phytochemicals_involved", [])
     if len(phytos) >= 1:
         score += 10
     else:
-        gaps.append("No phytochemicals identified")
+        gaps.append("Need specific phytochemicals responsible for the interaction")
 
     # Interaction summary — 10 pts
     summary = interaction_data.get("interaction_summary", "")
     if summary and len(summary) >= 80:
         score += 10
     else:
-        gaps.append("Interaction summary too brief or missing")
+        gaps.append("Need a detailed interaction summary (at least 80 characters)")
 
     if score >= 80:
         evidence_quality = "HIGH"
@@ -562,8 +763,119 @@ def _score_output(reasoning_output: dict, iteration: int) -> Tuple[bool, list, f
     else:
         evidence_quality = "LOW"
 
-    passes = score >= 60 or iteration >= MAX_COMAS_ITERATIONS
+    # Require at least some substantive clinical data to pass (not just metadata)
+    has_substance = bool(pk or pd or len(phytos) >= 1 or len(rc) >= 2)
+    passes = (score >= 60 and has_substance) or iteration >= MAX_COMAS_ITERATIONS
     return passes, gaps, score, evidence_quality
+
+
+def _boost_severity_from_evidence(
+    output: dict,
+    ayush_response: str,
+    allopathy_response: str,
+    reasoning_response: str,
+) -> None:
+    """Augment severity by adding pharmacodynamic evidence to the CYP-based score.
+
+    The Lambda's calculate_severity only scores CYP enzyme interactions.
+    This function scans agent responses for pharmacodynamic evidence (hypoglycemia,
+    synergy, bioavailability changes, etc.) and ADDS a capped PD boost on top of
+    the existing CYP-based score.
+
+    PD boost is capped at 25 to avoid over-inflating severity. This means PD
+    evidence alone can push severity from NONE to MINOR/MODERATE, and can elevate
+    a CYP-based MINOR to MODERATE, but won't push things to MAJOR on its own.
+    """
+    PD_BOOST_CAP = 25
+
+    if not isinstance(output, dict):
+        return
+    idata = output.get("interaction_data", {})
+    if not isinstance(idata, dict):
+        return
+
+    severity = idata.get("severity", "NONE")
+    severity_score = idata.get("severity_score", 0)
+
+    all_text = f"{ayush_response} {allopathy_response} {reasoning_response}".lower()
+
+    pd_boost = 0
+    existing_factors = list(idata.get("scoring_factors", []))
+    existing_factor_text = " ".join(existing_factors).lower()
+    new_factors = []
+
+    # Pharmacodynamic / clinical interaction evidence (grouped to avoid double-counting)
+    pd_groups = [
+        # Blood glucose effects (max one from this group)
+        [("hypoglyc", 10, "Hypoglycemic risk"),
+         ("blood glucose", 8, "Blood glucose effect"),
+         ("blood sugar", 8, "Blood sugar effect"),
+         ("glucose lower", 8, "Glucose lowering")],
+        # Mechanism synergy (max one from this group)
+        [("synergistic", 8, "Synergistic effect"),
+         ("synergy", 7, "Pharmacological synergy"),
+         ("additive effect", 7, "Additive pharmacodynamic effect")],
+        # Specific pathway modulation
+        [("ampk", 5, "AMPK pathway modulation")],
+        [("insulin sensitiz", 5, "Insulin sensitization")],
+        [("potentiat", 7, "Potentiation of drug effect")],
+        # Absorption / bioavailability
+        [("bioavailability", 6, "Bioavailability change")],
+        [("gastrointestinal", 4, "GI interaction")],
+        # Serious adverse effects
+        [("hepatotox", 6, "Hepatotoxicity concern")],
+        [("nephrotox", 6, "Nephrotoxicity concern")],
+        [("bleeding", 7, "Bleeding risk"),
+         ("anticoagul", 7, "Anticoagulant effect")],
+        [("serotonin", 7, "Serotonin modulation")],
+        [("sedat", 5, "Sedative effect")],
+    ]
+    for group in pd_groups:
+        for keyword, pts, label in group:
+            if keyword in all_text and label.lower() not in existing_factor_text:
+                pd_boost += pts
+                new_factors.append(f"{label} (+{pts})")
+                break  # only count one match per group
+
+    pd_boost = min(pd_boost, PD_BOOST_CAP)
+
+    # If severity was NONE/0, also look for CYP enzyme mentions in text
+    if severity_score == 0:
+        cyp_pattern = re.compile(r'cyp\d[a-z]\d+', re.IGNORECASE)
+        cyp_mentions = set(cyp_pattern.findall(all_text))
+        if cyp_mentions:
+            cyp_boost = min(len(cyp_mentions) * 5, 15)
+            pd_boost += cyp_boost
+            new_factors.append(
+                f"CYP enzymes mentioned: {', '.join(sorted(cyp_mentions))} (+{cyp_boost})"
+            )
+
+    if pd_boost <= 0:
+        return
+
+    combined_score = min(severity_score + pd_boost, 100)
+
+    thresholds = {"MAJOR": 60, "MODERATE": 35, "MINOR": 15}
+    if combined_score >= thresholds["MAJOR"]:
+        new_severity = "MAJOR"
+    elif combined_score >= thresholds["MODERATE"]:
+        new_severity = "MODERATE"
+    elif combined_score >= thresholds["MINOR"]:
+        new_severity = "MINOR"
+    else:
+        new_severity = "NONE"
+
+    if combined_score > severity_score:
+        idata["severity"] = new_severity
+        idata["severity_score"] = combined_score
+        idata["scoring_factors"] = existing_factors + new_factors
+        if new_severity != "NONE":
+            idata["interaction_exists"] = True
+        logger.info(
+            f"Severity augmented from {severity}({severity_score}) to "
+            f"{new_severity}({combined_score}): CYP base={severity_score}, "
+            f"PD boost={pd_boost}"
+        )
 
 
 # ──────────────────────────────────────────────────────────────
@@ -582,6 +894,7 @@ def _format_final_json(
     - Injects constructed IMPPAT URL
     - Extracts DrugBank URL from Allopathy agent's traces
     - Ensures reasoning_chain is populated
+    - Transforms knowledge graph to ADMET format
     - Returns the final result dict
     """
     if not isinstance(reasoning_output, dict):
@@ -599,9 +912,9 @@ def _format_final_json(
     if imppat_url and not interaction_data.get("imppat_url"):
         interaction_data["imppat_url"] = imppat_url
 
-    # Extract & inject DrugBank URL from allopathy agent traces
+    # Extract & inject DrugBank URL from allopathy agent traces + response
     if not interaction_data.get("drugbank_url"):
-        drugbank_url = _extract_drugbank_url(allopathy_traces)
+        drugbank_url = _extract_drugbank_url(allopathy_traces, "")
         if drugbank_url:
             interaction_data["drugbank_url"] = drugbank_url
 
@@ -632,6 +945,15 @@ def _format_final_json(
             ]
             if phytos:
                 interaction_data["phytochemicals_involved"] = phytos
+
+    # Transform knowledge graph to ADMET format with CYP enzyme overlap
+    kg = interaction_data.get("knowledge_graph", {})
+    if isinstance(kg, dict) and kg.get("nodes"):
+        allopathy_name = interaction_data.get("allopathy_name", "")
+        ayush_name_local = interaction_data.get("ayush_name", scientific_name)
+        interaction_data["knowledge_graph"] = _transform_graph_to_admet(
+            kg, ayush_name_local, allopathy_name,
+        )
 
     reasoning_output["interaction_data"] = interaction_data
     return reasoning_output
@@ -692,6 +1014,39 @@ def _call_compile_lambda(
         return outer
     except Exception as e:
         logger.error(f"Failed to call compile Lambda: {e}")
+        return {}
+
+
+def _call_severity_lambda(interactions_data_str: str, allopathy_name: str) -> dict:
+    """Directly invoke the calculate_severity Lambda function."""
+    try:
+        payload = {
+            "function": "calculate_severity",
+            "actionGroup": "reasoning_tools",
+            "parameters": [
+                {"name": "interactions_data", "value": interactions_data_str},
+                {"name": "allopathy_name", "value": allopathy_name},
+            ],
+        }
+        response = _get_lambda().invoke(
+            FunctionName="ausadhi-reasoning-tools",
+            InvocationType="RequestResponse",
+            Payload=json.dumps(payload).encode(),
+        )
+        result_raw = response["Payload"].read().decode("utf-8")
+        outer = json.loads(result_raw)
+        body_str = (
+            outer.get("response", {})
+                 .get("functionResponse", {})
+                 .get("responseBody", {})
+                 .get("TEXT", {})
+                 .get("body", "")
+        )
+        if body_str:
+            return json.loads(body_str)
+        return outer
+    except Exception as e:
+        logger.error(f"Failed to call severity Lambda: {e}")
         return {}
 
 
@@ -803,6 +1158,11 @@ def run_comas_pipeline(
     gaps_history = []
     last_output = {}
     allopathy_traces = []
+    pipeline_memory: dict = {
+        "successes": [],
+        "data_collected": {},
+        "source_urls": [],
+    }
 
     yield ("pipeline_status", {
         "status": "iteration_start",
@@ -824,21 +1184,67 @@ def run_comas_pipeline(
                                     "message": "Planner generating execution plan..."})
 
         gap_feedback = ""
+        latest_gap_list = []
         if gaps_history:
             latest_gaps = gaps_history[-1]
+            latest_gap_list = latest_gaps.get("gaps", [])
             gap_feedback = json.dumps({
-                "gaps": latest_gaps.get("gaps", []),
+                "gaps": latest_gap_list,
                 "score": latest_gaps.get("score", 0),
                 "evidence_quality": latest_gaps.get("evidence_quality", "LOW"),
             })
 
-        planner_prompt = (
-            f"Generate an execution plan for analyzing the interaction between "
-            f"AYUSH drug '{scientific_name}' (input: '{ayush_name}') and "
-            f"allopathy drug '{allopathy_name}'."
-        )
-        if gap_feedback:
-            planner_prompt += f"\n\nPrevious iteration identified gaps: {gap_feedback}"
+        if iteration == 1:
+            planner_prompt = (
+                f"Generate an execution plan for analyzing the interaction between "
+                f"AYUSH drug '{scientific_name}' (input: '{ayush_name}') and "
+                f"allopathy drug '{allopathy_name}'."
+            )
+        else:
+            gap_text = "\n".join(f"  {i+1}. {g}" for i, g in enumerate(latest_gap_list))
+            prev_score = gaps_history[-1].get("score", 0) if gaps_history else 0
+            prev_quality = gaps_history[-1].get("evidence_quality", "LOW") if gaps_history else "LOW"
+
+            # Build memory summary of what already worked
+            success_lines = []
+            for mem_entry in pipeline_memory.get("successes", []):
+                it_num = mem_entry.get("iteration", "?")
+                it_score = mem_entry.get("score", 0)
+                items = mem_entry.get("items", [])
+                if items:
+                    success_lines.append(
+                        f"  Iteration {it_num} (score {it_score}/100): "
+                        + "; ".join(items)
+                    )
+            memory_text = "\n".join(success_lines) if success_lines else "  No notable successes yet."
+            collected_data = pipeline_memory.get("data_collected", {})
+            data_notes = []
+            if collected_data.get("phytochemicals"):
+                data_notes.append(f"Phytochemicals found: {', '.join(collected_data['phytochemicals'][:5])}")
+            if collected_data.get("pk_mechanisms"):
+                data_notes.append("Pharmacokinetic mechanisms documented")
+            if collected_data.get("pd_mechanisms"):
+                data_notes.append("Pharmacodynamic mechanisms documented")
+            if collected_data.get("drugbank_url"):
+                data_notes.append(f"DrugBank URL: {collected_data['drugbank_url']}")
+            if collected_data.get("sources_found"):
+                data_notes.append(f"Source URLs collected: {len(pipeline_memory.get('source_urls', []))}")
+            data_text = "\n  ".join(data_notes) if data_notes else "None"
+
+            planner_prompt = (
+                f"ITERATION {iteration}: TARGETED GAP RESOLUTION\n\n"
+                f"Previous analysis of AYUSH drug '{scientific_name}' and "
+                f"allopathy drug '{allopathy_name}' scored {prev_score}/100 "
+                f"(evidence quality: {prev_quality}).\n\n"
+                f"== WHAT WORKED WELL (do NOT re-fetch) ==\n{memory_text}\n"
+                f"  Data already collected: {data_text}\n\n"
+                f"== REMAINING GAPS (must be filled) ==\n{gap_text}\n\n"
+                f"Create a TARGETED plan to fill ONLY the remaining gaps. "
+                f"Do NOT re-run agents whose data was already sufficient. "
+                f"For each gap, specify which agent (ayush, allopathy, or research) "
+                f"should run and what specific data it must retrieve. "
+                f"Set run=false for agents whose data was already good."
+            )
 
         # ── Stream planner traces directly (no buffering) ────────
         planner_response = ""
@@ -881,32 +1287,70 @@ def run_comas_pipeline(
 
         if run_ayush:
             proposer_stores["ayush"] = {}
-            ayush_prompt = (
-                f"Get comprehensive phytochemical data for {scientific_name}. "
-                f"Include IMPPAT data, CYP enzyme interactions, and key bioactive compounds. "
-                f"IMPPAT URL: {imppat_url}"
-            )
+            if iteration == 1:
+                ayush_prompt = (
+                    f"Get comprehensive phytochemical data for {scientific_name}. "
+                    f"Include IMPPAT data, CYP enzyme interactions, and key bioactive compounds. "
+                    f"IMPPAT URL: {imppat_url}"
+                )
+            else:
+                ayush_gaps = [g for g in latest_gap_list if any(
+                    kw in g.lower() for kw in ["phytochemical", "ayush", "cyp enzyme effect", "admet"]
+                )]
+                gap_detail = "; ".join(ayush_gaps) if ayush_gaps else "more detailed CYP enzyme interaction data"
+                ayush_prompt = (
+                    f"TARGETED SEARCH (iteration {iteration}): Previous analysis had gaps. "
+                    f"Focus on: {gap_detail}. "
+                    f"Get specific phytochemicals from {scientific_name} and their exact effects "
+                    f"on CYP450 enzymes (inhibition/induction). Include ADMET properties. "
+                    f"IMPPAT URL: {imppat_url}"
+                )
             t = threading.Thread(target=_run_agent, args=("ayush", ayush_prompt, proposer_stores["ayush"]))
             threads.append(("ayush", t))
 
         if run_allopathy:
             proposer_stores["allopathy"] = {}
-            allopathy_prompt = (
-                f"Get comprehensive data for {allopathy_name}. "
-                f"Include CYP metabolism pathways, NTI status, mechanism of action. "
-                f"Search DrugBank (domain: drugbank) for the drug page URL."
-            )
+            if iteration == 1:
+                allopathy_prompt = (
+                    f"Get comprehensive data for {allopathy_name}. "
+                    f"Include CYP metabolism pathways, NTI status, mechanism of action. "
+                    f"Search DrugBank (domain: drugbank) for the drug page URL."
+                )
+            else:
+                allo_gaps = [g for g in latest_gap_list if any(
+                    kw in g.lower() for kw in ["allopathy", "severity", "metabolism", "nti", "cyp"]
+                )]
+                gap_detail = "; ".join(allo_gaps) if allo_gaps else "more detailed CYP metabolism data"
+                allopathy_prompt = (
+                    f"TARGETED SEARCH (iteration {iteration}): Previous analysis had gaps. "
+                    f"Focus on: {gap_detail}. "
+                    f"Get specific CYP450 metabolism pathways for {allopathy_name}, NTI status, "
+                    f"and ADMET properties. "
+                    f"Search DrugBank (domain: drugbank) for the drug page URL."
+                )
             t = threading.Thread(target=_run_agent, args=("allopathy", allopathy_prompt, proposer_stores["allopathy"]))
             threads.append(("allopathy", t))
 
         if run_research:
             proposer_stores["research"] = {}
-            gap_context = f" Focus on: {gap_feedback}" if gap_feedback else ""
-            research_prompt = (
-                f"Search for clinical evidence of interactions between {scientific_name} "
-                f"and {allopathy_name}.{gap_context} "
-                f"Find PubMed articles, clinical trials, and pharmacological studies."
-            )
+            if iteration == 1:
+                research_prompt = (
+                    f"Search for clinical evidence of interactions between {scientific_name} "
+                    f"and {allopathy_name}. "
+                    f"Find PubMed articles, clinical trials, and pharmacological studies."
+                )
+            else:
+                research_gaps = [g for g in latest_gap_list if any(
+                    kw in g.lower() for kw in ["source", "evidence", "research", "pubmed", "clinical", "mechanism", "reasoning"]
+                )]
+                gap_detail = "; ".join(research_gaps) if research_gaps else "clinical interaction evidence and PubMed sources"
+                research_prompt = (
+                    f"TARGETED SEARCH (iteration {iteration}): Previous analysis had gaps. "
+                    f"Focus on: {gap_detail}. "
+                    f"Search PubMed and clinical databases for specific interaction evidence "
+                    f"between {scientific_name} and {allopathy_name}. "
+                    f"Provide URLs and detailed findings."
+                )
             t = threading.Thread(target=_run_agent, args=("research", research_prompt, proposer_stores["research"]))
             threads.append(("research", t))
 
@@ -999,11 +1443,70 @@ def run_comas_pipeline(
         except (json.JSONDecodeError, TypeError):
             pass
 
-        drugbank_url_rt = _extract_drugbank_url(allopathy_traces_local)
+        # Extract DrugBank URL from traces AND response text
+        drugbank_url_rt = _extract_drugbank_url(
+            allopathy_traces_local, allopathy_response_local
+        )
         if imppat_url:
             analysis_data_rt.setdefault("imppat_url", imppat_url)
         if drugbank_url_rt:
             analysis_data_rt.setdefault("drugbank_url", drugbank_url_rt)
+
+        # Extract source URLs from all agents' traces and responses
+        all_agent_sources = []
+        for agent_key, agent_resp, agent_traces in [
+            ("research", research_response, research_traces_local),
+            ("allopathy", allopathy_response_local, allopathy_traces_local),
+            ("ayush", ayush_response, ayush_traces_local),
+            ("reasoning", reasoning_response, reasoning_all_traces),
+        ]:
+            extracted = _extract_source_urls(agent_traces, agent_resp)
+            all_agent_sources.extend(extracted)
+
+        # Deduplicate sources by URL
+        seen_urls = set()
+        unique_sources = []
+        for src in all_agent_sources:
+            if src["url"] not in seen_urls:
+                seen_urls.add(src["url"])
+                unique_sources.append(src)
+
+        existing_sources = analysis_data_rt.get("sources", [])
+        if not existing_sources:
+            analysis_data_rt["sources"] = unique_sources
+        else:
+            for src in unique_sources:
+                if src["url"] not in {s.get("url") for s in existing_sources}:
+                    existing_sources.append(src)
+            analysis_data_rt["sources"] = existing_sources
+
+        # If Reasoning agent didn't call calculate_severity, call it directly
+        if not severity_result_rt:
+            logger.info("Reasoning agent did not call calculate_severity — calling directly")
+            try:
+                cyp_data = analysis_data_rt.get("cyp_enzymes", [])
+                if not cyp_data:
+                    # Try to extract CYP enzyme info from knowledge graph
+                    kg_nodes = knowledge_graph_rt.get("nodes", []) if isinstance(knowledge_graph_rt, dict) else []
+                    for node in kg_nodes:
+                        ndata = node.get("data", {})
+                        if ndata.get("type") in ("cyp_enzyme", "cyp_enzyme_overlap"):
+                            cyp_data.append({"name": ndata.get("label", ""), "effect": "interaction"})
+                if not cyp_data:
+                    # Scan agent responses for CYP enzyme mentions
+                    cyp_pattern = re.compile(r'CYP\d[A-Z]\d+', re.IGNORECASE)
+                    all_text = f"{ayush_response} {allopathy_response_local} {reasoning_response}"
+                    found_cyps = set(cyp_pattern.findall(all_text))
+                    for cyp in found_cyps:
+                        cyp_data.append({"name": cyp.upper(), "effect": "interaction"})
+                if cyp_data:
+                    sev_payload = json.dumps({"cyp_enzymes": cyp_data})
+                    sev_result = _call_severity_lambda(sev_payload, allopathy_name)
+                    if isinstance(sev_result, dict) and sev_result.get("success"):
+                        severity_result_rt = sev_result
+                        logger.info(f"Direct severity call: {sev_result.get('severity')} ({sev_result.get('severity_score')})")
+            except Exception as e:
+                logger.warning(f"Direct severity calculation failed: {e}")
 
         compile_result = _call_compile_lambda(
             ayush_name=scientific_name,
@@ -1022,6 +1525,21 @@ def run_comas_pipeline(
             scientific_name=scientific_name,
         )
 
+        # Post-process severity: boost if NONE/0 but evidence exists
+        _boost_severity_from_evidence(final_output, ayush_response, allopathy_response_local, reasoning_response)
+
+        # Merge with previous iteration's data — keep richer fields
+        if last_output and isinstance(last_output, dict) and isinstance(final_output, dict):
+            prev_idata = last_output.get("interaction_data", {}) or {}
+            curr_idata = final_output.get("interaction_data", {}) or {}
+            if isinstance(prev_idata, dict) and isinstance(curr_idata, dict):
+                for key in prev_idata:
+                    curr_val = curr_idata.get(key)
+                    prev_val = prev_idata[key]
+                    if curr_val in (None, "", [], {}, 0) and prev_val not in (None, "", [], {}, 0):
+                        curr_idata[key] = prev_val
+                final_output["interaction_data"] = curr_idata
+
         last_output = final_output
 
         # ── PHASE 4: SCORER (deterministic) ─────────────────────
@@ -1029,6 +1547,61 @@ def run_comas_pipeline(
                                     "message": "Scorer evaluating output quality..."})
 
         passes, gaps, score, evidence_quality = _score_output(final_output, iteration)
+
+        # Update evidence_quality in the output based on actual score
+        if isinstance(last_output, dict) and last_output.get("interaction_data"):
+            last_output["interaction_data"]["evidence_quality"] = evidence_quality
+
+        # Update pipeline memory with what succeeded in this iteration
+        idata = (last_output.get("interaction_data", {}) or {}) if isinstance(last_output, dict) else {}
+        iter_successes = []
+        iter_data = {}
+
+        if idata.get("ayush_name") and idata["ayush_name"] != scientific_name:
+            iter_successes.append("AYUSH drug identification confirmed")
+        if idata.get("phytochemicals_involved"):
+            iter_successes.append(f"Found {len(idata['phytochemicals_involved'])} phytochemicals")
+            iter_data["phytochemicals"] = [
+                p.get("name", p) if isinstance(p, dict) else p
+                for p in idata["phytochemicals_involved"]
+            ]
+        if idata.get("severity") and idata["severity"] != "NONE":
+            iter_successes.append(f"Severity assessed as {idata['severity']} ({idata.get('severity_score', 0)}/100)")
+        elif idata.get("severity_score", 0) > 0:
+            iter_successes.append(f"Severity score: {idata['severity_score']}/100")
+        if idata.get("mechanisms", {}).get("pharmacokinetic"):
+            pk_count = len(idata["mechanisms"]["pharmacokinetic"])
+            iter_successes.append(f"Found {pk_count} pharmacokinetic mechanisms")
+            iter_data["pk_mechanisms"] = True
+        if idata.get("mechanisms", {}).get("pharmacodynamic"):
+            pd_count = len(idata["mechanisms"]["pharmacodynamic"])
+            iter_successes.append(f"Found {pd_count} pharmacodynamic mechanisms")
+            iter_data["pd_mechanisms"] = True
+        if idata.get("sources"):
+            iter_successes.append(f"Found {len(idata['sources'])} source references")
+            iter_data["sources_found"] = True
+        kg = idata.get("knowledge_graph", {})
+        if isinstance(kg, dict) and kg.get("nodes"):
+            iter_successes.append(f"Knowledge graph built with {len(kg['nodes'])} nodes")
+        if idata.get("drugbank_url"):
+            iter_successes.append("DrugBank URL found")
+            iter_data["drugbank_url"] = idata["drugbank_url"]
+        if idata.get("reasoning_chain") and len(idata.get("reasoning_chain", [])) >= 2:
+            iter_successes.append(f"Reasoning chain has {len(idata['reasoning_chain'])} steps")
+        if idata.get("interaction_summary") and len(idata.get("interaction_summary", "")) >= 80:
+            iter_successes.append("Detailed interaction summary available")
+
+        pipeline_memory["successes"].append({
+            "iteration": iteration,
+            "items": iter_successes,
+            "score": score,
+        })
+        pipeline_memory["data_collected"].update(iter_data)
+
+        for src in idata.get("sources", []):
+            url = src.get("url", "") if isinstance(src, dict) else ""
+            if url and url not in pipeline_memory["source_urls"]:
+                pipeline_memory["source_urls"].append(url)
 
         if gaps:
             for gap in gaps:
@@ -1061,6 +1634,63 @@ def run_comas_pipeline(
         "status": "formatting",
         "message": "Formatting final output...",
     })
+
+    # Ensure final output has status=Success (force partial data if needed)
+    if not isinstance(last_output, dict) or last_output.get("status") != "Success":
+        logger.warning("Final output missing Success status — forcing with partial data")
+        partial = last_output if isinstance(last_output, dict) else {}
+        existing_idata = partial.get("interaction_data", {})
+        if not isinstance(existing_idata, dict):
+            existing_idata = {}
+
+        last_output = {
+            "status": "Success",
+            "interaction_data": {
+                "interaction_key": existing_idata.get(
+                    "interaction_key",
+                    f"{scientific_name.lower().strip()}#{allopathy_name.lower().strip()}",
+                ),
+                "ayush_name": existing_idata.get("ayush_name", scientific_name),
+                "allopathy_name": existing_idata.get("allopathy_name", allopathy_name),
+                "interaction_exists": existing_idata.get("interaction_exists", False),
+                "interaction_summary": existing_idata.get(
+                    "interaction_summary",
+                    f"Partial analysis of {scientific_name} and {allopathy_name} interaction. "
+                    f"Completed after {iteration} iterations with limited data.",
+                ),
+                "severity": existing_idata.get("severity", "NONE"),
+                "severity_score": existing_idata.get("severity_score", 0),
+                "is_nti": existing_idata.get("is_nti", False),
+                "scoring_factors": existing_idata.get("scoring_factors", []),
+                "mechanisms": existing_idata.get("mechanisms", {
+                    "pharmacokinetic": [], "pharmacodynamic": [],
+                }),
+                "phytochemicals_involved": existing_idata.get("phytochemicals_involved", []),
+                "clinical_effects": existing_idata.get("clinical_effects", []),
+                "recommendations": existing_idata.get("recommendations", [
+                    "Consult a qualified healthcare professional before combining these substances.",
+                ]),
+                "evidence_quality": existing_idata.get("evidence_quality", "LOW"),
+                "reasoning_chain": existing_idata.get("reasoning_chain", [{
+                    "step": 1,
+                    "reasoning": (
+                        f"Analyzed {scientific_name} phytochemicals and {allopathy_name} "
+                        f"metabolism pathways. Analysis completed with limited data."
+                    ),
+                    "evidence": "LOW confidence — partial data gathered across iterations.",
+                }]),
+                "knowledge_graph": existing_idata.get("knowledge_graph", {"nodes": [], "edges": []}),
+                "sources": existing_idata.get("sources", []),
+                "imppat_url": existing_idata.get("imppat_url", imppat_url),
+                "drugbank_url": existing_idata.get("drugbank_url", ""),
+                "disclaimer": (
+                    "This analysis is AI-generated for informational purposes only. "
+                    "Always consult qualified healthcare professionals before making "
+                    "clinical decisions about drug interactions."
+                ),
+                "generated_at": "",
+            },
+        }
 
     yield ("done", {
         "result": last_output,

@@ -2,6 +2,33 @@ import { useState } from 'react';
 import type { InteractionResult, ReasoningStep, Source, Mechanism } from '../types';
 import KnowledgeGraphView from './KnowledgeGraphView';
 
+const URL_REGEX = /https?:\/\/[^\s"',<>)\]]+/g;
+
+function TextWithLinks({ text, className }: { text: string; className?: string }) {
+  const parts = text.split(URL_REGEX);
+  const urls = text.match(URL_REGEX) || [];
+  if (urls.length === 0) return <span className={className}>{text}</span>;
+
+  const elements: React.ReactNode[] = [];
+  parts.forEach((part, i) => {
+    elements.push(<span key={`t${i}`}>{part}</span>);
+    if (i < urls.length) {
+      elements.push(
+        <a
+          key={`u${i}`}
+          href={urls[i]}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-blue-400 hover:text-blue-300 underline break-all"
+        >
+          {urls[i]}
+        </a>
+      );
+    }
+  });
+  return <span className={className}>{elements}</span>;
+}
+
 const SEVERITY_CLASSES: Record<string, string> = {
   NONE: 'severity-none',
   MINOR: 'severity-minor',
@@ -216,10 +243,23 @@ export default function ResultPanel({ result }: Props) {
                 <h3 className="text-sm font-semibold text-purple-400 mb-3">Pharmacokinetic Mechanisms</h3>
                 <ul className="space-y-2">
                   {d.mechanisms.pharmacokinetic.map((m, i) => {
-                    const text = typeof m === 'string' ? m : (m as Mechanism).description ?? JSON.stringify(m);
+                    const mech = m as any;
+                    const desc = typeof m === 'string' ? m : mech.description ?? mech.mechanism ?? '';
+                    const evidence = typeof m !== 'string' ? mech.evidence : '';
+                    const confidence = typeof m !== 'string' ? mech.confidence : '';
                     return (
                       <li key={i} className="text-sm text-gray-300 bg-purple-900/20 rounded p-3">
-                        {text}
+                        <TextWithLinks text={desc || JSON.stringify(m)} />
+                        {evidence && (
+                          <p className="text-xs text-gray-500 italic mt-1">
+                            Evidence: <TextWithLinks text={evidence} />
+                          </p>
+                        )}
+                        {confidence && (
+                          <span className="text-xs text-gray-600 mt-1 inline-block">
+                            Confidence: {confidence}
+                          </span>
+                        )}
                       </li>
                     );
                   })}
@@ -231,10 +271,23 @@ export default function ResultPanel({ result }: Props) {
                 <h3 className="text-sm font-semibold text-cyan-400 mb-3">Pharmacodynamic Mechanisms</h3>
                 <ul className="space-y-2">
                   {d.mechanisms.pharmacodynamic.map((m, i) => {
-                    const text = typeof m === 'string' ? m : (m as Mechanism).description ?? JSON.stringify(m);
+                    const mech = m as any;
+                    const desc = typeof m === 'string' ? m : mech.description ?? mech.mechanism ?? '';
+                    const evidence = typeof m !== 'string' ? mech.evidence : '';
+                    const confidence = typeof m !== 'string' ? mech.confidence : '';
                     return (
                       <li key={i} className="text-sm text-gray-300 bg-cyan-900/20 rounded p-3">
-                        {text}
+                        <TextWithLinks text={desc || JSON.stringify(m)} />
+                        {evidence && (
+                          <p className="text-xs text-gray-500 italic mt-1">
+                            Evidence: <TextWithLinks text={evidence} />
+                          </p>
+                        )}
+                        {confidence && (
+                          <span className="text-xs text-gray-600 mt-1 inline-block">
+                            Confidence: {confidence}
+                          </span>
+                        )}
                       </li>
                     );
                   })}
@@ -258,9 +311,13 @@ export default function ResultPanel({ result }: Props) {
                       Step {step.step ?? i + 1}
                     </span>
                   </div>
-                  <p className="text-sm text-gray-200 leading-relaxed mb-2">{step.reasoning}</p>
+                  <p className="text-sm text-gray-200 leading-relaxed mb-2">
+                    <TextWithLinks text={step.reasoning} />
+                  </p>
                   {step.evidence && (
-                    <p className="text-xs text-gray-500 italic">Evidence: {step.evidence}</p>
+                    <p className="text-xs text-gray-500 italic">
+                      Evidence: <TextWithLinks text={step.evidence} />
+                    </p>
                   )}
                 </div>
               ))
