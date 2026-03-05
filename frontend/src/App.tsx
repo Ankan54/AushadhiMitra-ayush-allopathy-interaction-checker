@@ -1,6 +1,7 @@
 import { useState, useRef, useCallback } from 'react';
 import DrugInputForm from './components/DrugInputForm';
-import PipelineTimeline from './components/PipelineTimeline';
+import PipelineGraph from './components/PipelineGraph';
+import LiveActivitySidebar from './components/LiveActivitySidebar';
 import ResultPanel from './components/ResultPanel';
 import ErrorDisplay from './components/ErrorDisplay';
 import PipelineFlowModal from './components/PipelineFlowModal';
@@ -10,9 +11,10 @@ import type {
   PipelineIteration,
   AgentTrace,
   InteractionResult,
+  TimelineEvent,
 } from './types';
 
-const AGENT_LABELS: Record<string, string> = {
+const AGENT_LABELS_MAP: Record<string, string> = {
   Planner: 'planner',
   AYUSH: 'ayush',
   Allopathy: 'allopathy',
@@ -22,7 +24,7 @@ const AGENT_LABELS: Record<string, string> = {
 
 function makeAgentTrace(label: string): AgentTrace {
   return {
-    key: AGENT_LABELS[label] ?? label.toLowerCase(),
+    key: AGENT_LABELS_MAP[label] ?? label.toLowerCase(),
     label,
     thinking: [],
     llm_invocations: [],
@@ -141,6 +143,46 @@ function applyEvent(state: PipelineState, e: WsEvent): PipelineState {
   return { ...s, iterations: updatedIters };
 }
 
+let _eventIdCounter = 0;
+
+function wsEventToTimeline(e: WsEvent): TimelineEvent | null {
+  const base = {
+    id: ++_eventIdCounter,
+    timestamp: Date.now(),
+    type: e.type as TimelineEvent['type'],
+  };
+
+  if (e.type === 'pipeline_status') {
+    return { ...base, message: e.message, detail: e.status, iteration: e.iteration };
+  }
+  if (e.type === 'agent_thinking') {
+    return { ...base, agent: e.agent, agentKey: e.agent_key ?? AGENT_LABELS_MAP[e.agent], message: `Thinking…`, detail: e.message, iteration: e.iteration };
+  }
+  if (e.type === 'llm_call') {
+    return { ...base, agent: e.agent, agentKey: e.agent_key ?? AGENT_LABELS_MAP[e.agent], message: `LLM invocation`, detail: e.prompt_preview?.slice(0, 100), iteration: e.iteration };
+  }
+  if (e.type === 'llm_response') {
+    const tokens = e.tokens ? `${e.tokens.inputTokens ?? '?'}in / ${e.tokens.outputTokens ?? '?'}out` : undefined;
+    return { ...base, agent: e.agent, agentKey: e.agent_key ?? AGENT_LABELS_MAP[e.agent], message: `LLM response`, detail: tokens, iteration: e.iteration };
+  }
+  if (e.type === 'tool_call') {
+    return { ...base, agent: e.agent, agentKey: e.agent_key ?? AGENT_LABELS_MAP[e.agent], message: `Tool: ${e.function ?? 'unknown'}`, detail: e.message, iteration: e.iteration };
+  }
+  if (e.type === 'tool_result') {
+    return { ...base, agent: e.agent, agentKey: e.agent_key ?? AGENT_LABELS_MAP[e.agent], message: `Tool result`, detail: e.message, iteration: e.iteration };
+  }
+  if (e.type === 'agent_complete') {
+    return { ...base, agent: e.agent, agentKey: e.agent_key ?? AGENT_LABELS_MAP[e.agent], message: `${e.agent} complete`, completed: true, iteration: e.iteration };
+  }
+  if (e.type === 'complete') {
+    return { ...base, message: 'Analysis complete', completed: true };
+  }
+  if (e.type === 'error') {
+    return { ...base, message: `Error: ${e.message}` };
+  }
+  return null;
+}
+
 export default function App() {
   const [ayushDrug, setAyushDrug] = useState('');
   const [allopathyDrug, setAllopathyDrug] = useState('');
@@ -149,6 +191,7 @@ export default function App() {
   const [result, setResult] = useState<InteractionResult | null>(null);
   const [error, setError] = useState<{ message: string; supported_drugs?: string[] } | null>(null);
   const [showFlowModal, setShowFlowModal] = useState(false);
+  const [eventLog, setEventLog] = useState<TimelineEvent[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
 
   const handleSubmit = useCallback(async () => {
@@ -158,6 +201,14 @@ export default function App() {
     setIsLoading(true);
     setResult(null);
     setError(null);
+    _eventIdCounter = 0;
+    setEventLog([{
+      id: ++_eventIdCounter,
+      timestamp: Date.now(),
+      type: 'pipeline_status',
+      message: 'Analysis started',
+      detail: `${ayushDrug.trim()} + ${allopathyDrug.trim()}`,
+    }]);
     setPipeline({
       status: 'running',
       currentIteration: 0,
@@ -206,6 +257,12 @@ export default function App() {
           return;
         }
 
+        // Push to timeline log
+        const tlEvent = wsEventToTimeline(e);
+        if (tlEvent) {
+          setEventLog((prev) => [...prev, tlEvent]);
+        }
+
         if (e.type === 'error') {
           setError({ message: e.message, supported_drugs: e.supported_drugs });
           setIsLoading(false);
@@ -244,11 +301,13 @@ export default function App() {
     }
   }, [ayushDrug, allopathyDrug]);
 
+  const showSidebar = pipeline !== null || eventLog.length > 0;
+
   return (
     <div className="min-h-screen bg-gray-950 text-gray-100">
       {/* Header */}
       <header className="border-b border-gray-800 bg-gray-900/80 backdrop-blur-sm sticky top-0 z-40">
-        <div className="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between">
+        <div className="mx-auto px-4 py-3 flex items-center justify-between" style={{ maxWidth: '90rem' }}>
           <div className="flex items-center gap-3">
             <span className="text-2xl">🌿</span>
             <div>
@@ -265,46 +324,50 @@ export default function App() {
         </div>
       </header>
 
-      <main className="max-w-7xl mx-auto px-4 py-6">
-        {/* Drug Input Form */}
-        <div className="bg-gray-900 border border-gray-800 rounded-xl px-6 py-5 mb-6">
-          <DrugInputForm
-            ayushDrug={ayushDrug}
-            allopathyDrug={allopathyDrug}
-            onAyushChange={setAyushDrug}
-            onAllopathyChange={setAllopathyDrug}
-            onSubmit={handleSubmit}
-            isLoading={isLoading}
-          />
-        </div>
-
-        {/* Error */}
-        {error && <ErrorDisplay message={error.message} supportedDrugs={error.supported_drugs} />}
-
-        {/* Two-column layout: pipeline (left) + result (right) */}
-        {(pipeline || result) && !error && (
-          <div className="grid grid-cols-1 xl:grid-cols-2 gap-6 items-start">
-            {/* Left: Pipeline timeline */}
-            {pipeline && (
-              <div>
-                <PipelineTimeline pipeline={pipeline} />
-              </div>
-            )}
-
-            {/* Right: Final result */}
-            {result && (
-              <div>
-                <ResultPanel result={result} />
-              </div>
-            )}
-
-            {/* If pipeline running but no result yet, occupy full width */}
-            {pipeline && !result && (
-              <div />
-            )}
+      <div className="flex" style={{ minHeight: 'calc(100vh - 57px)' }}>
+        {/* Main content area */}
+        <main className={`flex-1 min-w-0 px-4 py-6 ${showSidebar ? 'mr-0' : ''}`} style={{ maxWidth: showSidebar ? 'calc(100% - 340px)' : '100%' }}>
+          {/* Drug Input Form */}
+          <div className="bg-gray-900 border border-gray-800 rounded-xl px-6 py-5 mb-6 max-w-4xl">
+            <DrugInputForm
+              ayushDrug={ayushDrug}
+              allopathyDrug={allopathyDrug}
+              onAyushChange={setAyushDrug}
+              onAllopathyChange={setAllopathyDrug}
+              onSubmit={handleSubmit}
+              isLoading={isLoading}
+            />
           </div>
+
+          {/* Error */}
+          {error && (
+            <div className="max-w-4xl">
+              <ErrorDisplay message={error.message} supportedDrugs={error.supported_drugs} />
+            </div>
+          )}
+
+          {/* Pipeline Graph */}
+          {pipeline && !error && (
+            <div className="mb-6">
+              <PipelineGraph pipeline={pipeline} />
+            </div>
+          )}
+
+          {/* Result Panel (below pipeline) */}
+          {result && !error && (
+            <div>
+              <ResultPanel result={result} />
+            </div>
+          )}
+        </main>
+
+        {/* Right sidebar: Live Activity */}
+        {showSidebar && (
+          <aside className="w-[340px] shrink-0 border-l border-gray-800 sticky top-[57px] h-[calc(100vh-57px)]">
+            <LiveActivitySidebar events={eventLog} isRunning={isLoading} />
+          </aside>
         )}
-      </main>
+      </div>
 
       {/* CO-MAS flow modal */}
       {showFlowModal && <PipelineFlowModal onClose={() => setShowFlowModal(false)} />}

@@ -220,3 +220,16 @@ export type InteractionResult = {
   interaction_data?: InteractionData;
   failure_reason?: string;
 };
+
+// ── Timeline event for Live Activity feed ─────────────────────
+export type TimelineEvent = {
+  id: number;
+  timestamp: number;
+  type: WsEvent["type"];
+  agent?: string;
+  agentKey?: string;
+  message: string;
+  detail?: string;
+  iteration?: number;
+  completed?: boolean;
+};

@@ -5,6 +5,7 @@ import KnowledgeGraphView from './KnowledgeGraphView';
 const URL_REGEX = /https?:\/\/[^\s"',<>)\]]+/g;
 
 function TextWithLinks({ text, className }: { text: string; className?: string }) {
+  if (!text) return <span className={className}>{text ?? ''}</span>;
   const parts = text.split(URL_REGEX);
   const urls = text.match(URL_REGEX) || [];
   if (urls.length === 0) return <span className={className}>{text}</span>;
