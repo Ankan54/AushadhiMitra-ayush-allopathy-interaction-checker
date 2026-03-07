@@ -1,0 +1,32 @@
+{
+  "version": "1.0",
+  "presets": {
+    "research": {
+      "include_domains": [
+        "pubmed.ncbi.nlm.nih.gov", "ncbi.nlm.nih.gov", "doi.org",
+        "springer.com", "sciencedirect.com", "nature.com", "wiley.com",
+        "academic.oup.com", "frontiersin.org", "mdpi.com",
+        "biorxiv.org", "medrxiv.org", "cochranelibrary.com", "clinicaltrials.gov"
+      ]
+    },
+    "allopathy": {
+      "include_domains": [
+        "go.drugbank.com", "drugbank.com", "drugs.com", "rxlist.com",
+        "fda.gov", "ema.europa.eu", "medlineplus.gov", "uptodate.com",
+        "pubmed.ncbi.nlm.nih.gov", "msdmanuals.com"
+      ]
+    },
+    "ayush": {
+      "include_domains": [
+        "pubmed.ncbi.nlm.nih.gov", "examine.com", "cb.imsc.res.in",
+        "ayush.gov.in", "sciencedirect.com", "springer.com",
+        "herbalgram.org", "nccih.nih.gov"
+      ]
+    },
+    "drugbank": {
+      "include_domains": [
+        "go.drugbank.com", "drugbank.com"
+      ]
+    }
+  }
+}

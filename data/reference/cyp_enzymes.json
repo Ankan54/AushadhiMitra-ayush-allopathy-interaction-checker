@@ -1,0 +1,85 @@
+{
+  "version": "1.0",
+  "last_updated": "2026-02-28",
+  "description": "CYP450 enzyme reference data for drug metabolism analysis",
+  "enzymes": {
+    "CYP3A4": {
+      "name": "CYP3A4",
+      "full_name": "Cytochrome P450 3A4",
+      "importance": "major",
+      "metabolizes_percentage": 50,
+      "description": "Most abundant CYP enzyme, metabolizes approximately 50% of all drugs",
+      "severity_weight": 15,
+      "common_substrates": ["Cyclosporine", "Tacrolimus", "Midazolam", "Simvastatin", "Atorvastatin"]
+    },
+    "CYP2D6": {
+      "name": "CYP2D6",
+      "full_name": "Cytochrome P450 2D6",
+      "importance": "major",
+      "metabolizes_percentage": 25,
+      "description": "Metabolizes ~25% of drugs, highly polymorphic",
+      "severity_weight": 15,
+      "common_substrates": ["Codeine", "Tramadol", "Metoprolol", "Fluoxetine", "Tamoxifen"]
+    },
+    "CYP2C9": {
+      "name": "CYP2C9",
+      "full_name": "Cytochrome P450 2C9",
+      "importance": "major",
+      "metabolizes_percentage": 15,
+      "description": "Metabolizes ~15% of drugs including Warfarin (S-warfarin)",
+      "severity_weight": 15,
+      "common_substrates": ["Warfarin", "Phenytoin", "Losartan", "Diclofenac", "Celecoxib"]
+    },
+    "CYP2C19": {
+      "name": "CYP2C19",
+      "full_name": "Cytochrome P450 2C19",
+      "importance": "moderate",
+      "metabolizes_percentage": 10,
+      "description": "Important for proton pump inhibitors and some antidepressants",
+      "severity_weight": 10,
+      "common_substrates": ["Omeprazole", "Clopidogrel", "Diazepam", "Escitalopram"]
+    },
+    "CYP1A2": {
+      "name": "CYP1A2",
+      "full_name": "Cytochrome P450 1A2",
+      "importance": "moderate",
+      "metabolizes_percentage": 10,
+      "description": "Metabolizes caffeine, theophylline, and some antipsychotics",
+      "severity_weight": 10,
+      "common_substrates": ["Theophylline", "Caffeine", "Clozapine", "Olanzapine"]
+    },
+    "CYP2B6": {
+      "name": "CYP2B6",
+      "full_name": "Cytochrome P450 2B6",
+      "importance": "minor",
+      "metabolizes_percentage": 5,
+      "description": "Metabolizes bupropion, efavirenz, and some anesthetics",
+      "severity_weight": 5,
+      "common_substrates": ["Bupropion", "Efavirenz", "Cyclophosphamide"]
+    },
+    "CYP2E1": {
+      "name": "CYP2E1",
+      "full_name": "Cytochrome P450 2E1",
+      "importance": "minor",
+      "metabolizes_percentage": 3,
+      "description": "Metabolizes ethanol, acetaminophen, and some volatile anesthetics",
+      "severity_weight": 5,
+      "common_substrates": ["Acetaminophen", "Isoflurane", "Ethanol"]
+    }
+  },
+  "severity_thresholds": {
+    "NONE": {"min": 0, "max": 14},
+    "MINOR": {"min": 15, "max": 34},
+    "MODERATE": {"min": 35, "max": 59},
+    "MAJOR": {"min": 60, "max": 100}
+  },
+  "scoring_rules": {
+    "cyp_overlap_major_pathway": 15,
+    "cyp_overlap_moderate_pathway": 10,
+    "cyp_overlap_minor_pathway": 5,
+    "nti_drug_boost": 25,
+    "research_evidence_strong": 30,
+    "research_evidence_moderate": 20,
+    "pharmacodynamic_overlap": 15
+  }
+}

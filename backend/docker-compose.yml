@@ -1,0 +1,34 @@
+version: "3.8"
+
+services:
+  app:
+    build: .
+    ports:
+      - "8100:8000"
+    volumes:
+      - ~/.aws:/root/.aws:ro
+    environment:
+      - AWS_REGION=us-east-1
+      - AWS_DEFAULT_REGION=us-east-1
+      - S3_BUCKET=ausadhi-mitra-667736132441
+      # CO-MAS agents — TSTALIASID always routes to the latest DRAFT version
+      - PLANNER_AGENT_ID=JRARFMAC40
+      - PLANNER_AGENT_ALIAS=TSTALIASID
+      - AYUSH_AGENT_ID=0SU1BHJ78L
+      - AYUSH_AGENT_ALIAS=TSTALIASID
+      - ALLOPATHY_AGENT_ID=CNAZG8LA0H
+      - ALLOPATHY_AGENT_ALIAS=TSTALIASID
+      - REASONING_AGENT_ID=03NGZ4CNF3
+      - REASONING_AGENT_ALIAS=TSTALIASID
+      - RESEARCH_AGENT_ID=7DCGAF6N1A
+      - RESEARCH_AGENT_ALIAS=TSTALIASID
+      - MAX_COMAS_ITERATIONS=3
+      - DB_HOST=scm-postgres.c2na6oc62pb7.us-east-1.rds.amazonaws.com
+      - DB_PORT=5432
+      - DB_NAME=aushadhimitra
+      - DB_USER=scm_admin
+      - DB_PASSWORD=${DB_PASSWORD:?Set DB_PASSWORD}
+      - DB_SSL=require
+    restart: unless-stopped
+
+  # nginx disabled — FastAPI serves static files directly on port 8100
